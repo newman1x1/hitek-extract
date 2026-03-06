@@ -26,11 +26,11 @@ jobs:
           rclone version
 
       # ── 4. Python dependencies ────────────────────────────────────
-      #     yajl2 = C JSON backend for ijson (~3-5x faster parsing)
+      #     yajl2_cffi = C JSON backend for ijson (~3-5x faster parsing)
       - name: Install Python packages
         run: |
-          sudo apt-get install -y libyajl2
-          pip install ijson yajl2
+          sudo apt-get install -y libyajl2 libyajl-dev
+          pip install ijson yajl2_cffi
 
       # ── 5. rclone config from repository secret ───────────────────
       - name: Configure rclone
