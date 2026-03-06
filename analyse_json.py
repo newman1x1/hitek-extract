@@ -24,9 +24,12 @@
   • Schema tree with field presence rates
   • Runtime estimate and throughput
 
-  Runtime estimate on GitHub Actions
+  Early stop
   ────────────────────────────────────────────────────────────────────
-  479 GB file, rclone cat ~60–100 MB/s → ~1.5–2.5 h, well within 6 h.
+  Schema discovery usually completes within a few million records.
+  If no new fields appear for 5 M consecutive records, analysis
+  terminates early — typically finishing in ~5–15 min even on a
+  ~10 MB/s Google Drive connection.
 ═══════════════════════════════════════════════════════════════════════
 """
 
@@ -68,6 +71,8 @@ MAX_SAMPLES           = 25    # unique sample values kept per field
 MAX_TOP_VALUES        = 200   # top-N frequent values tracked per field (Counter cap)
 MAX_CHILDREN_PER_DEPTH = 500  # max unique keys tracked per object node (memory guard)
 LOG_INTERVAL          = 60    # seconds between progress lines in CI
+SCHEMA_STABLE_RECORDS    = 5_000_000   # stop early if no new fields for this many consecutive records
+STABILITY_CHECK_INTERVAL = 100_000     # records between schema-stability checks
 
 # ════════════════════════════════════════════════════════════════════════════════
 # HELPERS
@@ -445,10 +450,22 @@ def detect_top_level_from_bytes(header: bytes) -> tuple[str, str]:
     return ('unknown', '')
 
 
+def _count_fields(node: dict) -> int:
+    """Recursively count total unique field nodes in the schema tree."""
+    count = len(node.get('children', {}))
+    for child in node.get('children', {}).values():
+        count += _count_fields(child)
+    return count
+
+
 def run_analysis(pipe_stream, file_size: int) -> dict:
     """
     Stream-parse bytes from pipe_stream (rclone cat stdout) with ijson.
     file_size is used only for progress percentage / ETA display.
+
+    Early-stop: if no new fields are discovered for SCHEMA_STABLE_RECORDS
+    consecutive records, the schema is fully mapped and the analysis
+    terminates early (avoids reading the entire 446 GB at ~10 MB/s).
     """
     # Peek at first 64 KB to detect structure, then prepend back.
     # Use _read_up_to instead of a single read(): a raw OS pipe returns only
@@ -472,6 +489,14 @@ def run_analysis(pipe_stream, file_size: int) -> dict:
     record_count  = 0
     start_time    = time.time()
     last_log_time = start_time
+
+    # Early-stop tracking: if the schema tree stops growing (no new field
+    # paths) for SCHEMA_STABLE_RECORDS consecutive records, we break out
+    # of the loop.  This avoids streaming 400+ GB when the schema is
+    # already fully discovered after just a few million records.
+    _prev_field_count  = 0
+    _last_new_field_at = 0
+    _early_stop        = False
 
     def _items(pfx):
         try:
@@ -504,23 +529,58 @@ def run_analysis(pipe_stream, file_size: int) -> dict:
 
     parse_error: str | None = None
     interrupted: bool       = False
+    def _check_stability() -> bool:
+        """Return True if schema has stabilised and we should stop."""
+        nonlocal _prev_field_count, _last_new_field_at, _early_stop
+        if record_count % STABILITY_CHECK_INTERVAL != 0:
+            return False
+        cur = _count_fields(root)
+        if cur > _prev_field_count:
+            _last_new_field_at = record_count
+            _prev_field_count  = cur
+            return False
+        if record_count - _last_new_field_at >= SCHEMA_STABLE_RECORDS:
+            _early_stop = True
+            log(f'🏁 Schema stable — {cur} total fields, no new '
+                f'discoveries in last {fmt_num(SCHEMA_STABLE_RECORDS)} '
+                f'records. Stopping early at record '
+                f'{fmt_num(record_count)}.')
+            return True
+        return False
+
     try:
         if top_level == 'array' or (top_level == 'object' and '.' in prefix):
+            children = root['children']
             for record in _items(prefix):
                 record_count += 1
                 if isinstance(record, dict):
                     for k, v in record.items():
-                        analyse_value(root['children'].setdefault(str(k), new_field()), v, 1)
+                        key = str(k)
+                        child = children.get(key)
+                        if child is None:
+                            child = new_field()
+                            children[key] = child
+                        analyse_value(child, v, 1)
                     root['seen'] += 1
                 else:
                     analyse_value(root, record, 0)
                 _log_progress()
+                if _check_stability():
+                    break
         else:
+            children = root['children']
             for key, value in _kvitems():
                 record_count += 1
-                analyse_value(root['children'].setdefault(str(key), new_field()), value, 1)
+                skey = str(key)
+                child = children.get(skey)
+                if child is None:
+                    child = new_field()
+                    children[skey] = child
+                analyse_value(child, value, 1)
                 root['seen'] = record_count
                 _log_progress()
+                if _check_stability():
+                    break
     except Exception as exc:
         # Catch all parse/backend errors, not just ijson.JSONError: when _ijson
         # is set to a specific backend module (yajl2_cffi, yajl2_c), it may raise
@@ -557,6 +617,13 @@ def run_analysis(pipe_stream, file_size: int) -> dict:
     if interrupted:
         result['interrupted'] = True
         result['partial']     = True
+    if _early_stop:
+        result['early_stop'] = True
+        result['early_stop_reason'] = (
+            f'Schema stabilised after {fmt_num(record_count)} records — '
+            f'no new fields in last {fmt_num(SCHEMA_STABLE_RECORDS)}.'
+        )
+        result['total_fields_discovered'] = _prev_field_count
     return result
 
 
@@ -614,6 +681,10 @@ def build_report(raw: dict) -> dict:
         **({'WARNING':      f'PARTIAL DATA — JSON parse error: {raw["parse_error"]}',
              'partial':     True}
            if raw.get('partial') else {}),
+        **({'early_stop':              True,
+            'early_stop_reason':       raw['early_stop_reason'],
+            'total_fields_discovered': raw['total_fields_discovered']}
+           if raw.get('early_stop') else {}),
     }
 
 
@@ -641,6 +712,10 @@ def render_txt(report: dict) -> str:
     row('Top-level fields',   fmt_num(report['field_count']))
     row('Analysis duration',  report['elapsed_human'])
     row('Average throughput', report['throughput_human'])
+    if report.get('early_stop'):
+        row('Early stop',         '✓  (schema fully discovered)')
+        row('Fields discovered',  fmt_num(report['total_fields_discovered']))
+        row('Reason',             report['early_stop_reason'])
 
     h2('SCHEMA — ALL FIELDS')
 
@@ -853,6 +928,8 @@ def main():
         log(f'\u26a0\ufe0f  PARTIAL DATA — JSON parse error interrupted the stream.')
         log(f'   Records collected before error: {fmt_num(raw_stats["record_count"])}')
         log(f'   Error: {raw_stats["parse_error"]}')
+    if raw_stats.get('early_stop'):
+        log(f'🏁 {raw_stats["early_stop_reason"]}')
 
     record_count = raw_stats['record_count']
     elapsed      = raw_stats['elapsed_seconds']
@@ -886,7 +963,10 @@ def main():
     if raw_stats.get('interrupted'):
         log('⚠️  Analysis was interrupted — partial report saved.')
         sys.exit(130)   # conventional: 128 + SIGINT(2)
-    log('🎉 Analysis complete!')
+    if raw_stats.get('early_stop'):
+        log('🏁 Analysis complete (early stop — schema fully discovered)!')
+    else:
+        log('🎉 Analysis complete!')
 
 
 if __name__ == '__main__':
