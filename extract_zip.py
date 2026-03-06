@@ -51,8 +51,8 @@ except ImportError:
 RCLONE_REMOTE   = 'Gdrive'
 SOURCE_FOLDER   = 'HiTek_Extracted'       # Drive folder containing users_data.zip
 ZIP_NAME        = 'users_data.zip'        # The zip file inside SOURCE_FOLDER
-OUTPUT_FOLDER   = 'HiTek_Files'           # Drive folder to upload extracted files into
-CHUNK_SIZE      = 256 * 1024 * 1024       # 256 MB upload chunks
+OUTPUT_FOLDER   = 'users_data_extracted'  # Drive folder to upload extracted files into
+CHUNK_SIZE      = 512 * 1024 * 1024       # 512 MB upload chunks (fewer round trips)
 MIN_SPEED_BPS   = 32 * 1024              # 32 KB/s — sets generous timeouts
 MAX_UPLOAD_RETRIES = 20
 MAX_SESS_RETRIES   = 15
@@ -432,8 +432,8 @@ def main():
             '--vfs-cache-mode', 'off',
             '--read-only',
             '--no-modtime',
-            '--dir-cache-time', '5m',
-            '--log-level', 'ERROR',
+            '--dir-cache-time', '5m',            '--buffer-size',    '256M',   # read-ahead buffer for sequential reads
+            '--vfs-read-ahead', '512M',   # prefetch window for FUSE reads            '--log-level', 'ERROR',
         ],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.PIPE,
@@ -447,12 +447,16 @@ def main():
                 ['taskkill', '/F', '/PID', str(mount_proc.pid)],
                 capture_output=True,
             )
-        try:
-            if sys.platform != 'win32':
-                subprocess.run(['fusermount', '-uz', mount_dir],
-                               capture_output=True, timeout=10)
-        except Exception:
-            pass
+        else:
+            # FUSE3 uses fusermount3; fall back to fusermount for older systems.
+            for cmd in ['fusermount3', 'fusermount']:
+                try:
+                    r = subprocess.run([cmd, '-uz', mount_dir],
+                                       capture_output=True, timeout=10)
+                    if r.returncode == 0:
+                        break
+                except Exception:
+                    continue
         try:
             os.rmdir(mount_dir)
         except Exception:
@@ -539,9 +543,35 @@ def main():
                 time.sleep(jittered_backoff(attempt))
         return ''
 
+    def file_exists_on_drive(name: str) -> bool:
+        """Return True if a file with this name already exists in the output folder."""
+        file_name = os.path.basename(name) or name.replace('/', '_')
+        # Escape single quotes to avoid breaking the Drive API query syntax.
+        safe_name = file_name.replace("'", "\\'")
+        for attempt in range(5):
+            try:
+                r = sess.get(
+                    'https://www.googleapis.com/drive/v3/files',
+                    headers={'Authorization': f'Bearer {token_mgr.get_token()}'},
+                    params={
+                        'q': (
+                            f"name='{safe_name}' and "
+                            f"'{folder_id}' in parents and "
+                            f"trashed=false"
+                        ),
+                        'fields': 'files(id,size)',
+                    },
+                    timeout=30,
+                )
+                r.raise_for_status()
+                files = r.json().get('files', [])
+                return len(files) > 0
+            except Exception:
+                time.sleep(jittered_backoff(attempt))
+        return False
+
     print("\n" + "━" * 72)
 
-    interrupted = False
     try:
         for file_idx, entry in enumerate(remaining, start=len(completed) + 1):
             fname       = entry.filename
@@ -555,6 +585,23 @@ def main():
                 ts = time.strftime('%H:%M:%S')
                 print(f"[{ts}] 📄 [{file_idx}/{len(all_entries)}] {short_name}  "
                       f"({file_size/1e6:.1f} MB)", flush=True)
+
+            # Check if already on Drive (handles case where session expired
+            # before the script could mark the file as complete).
+            if file_exists_on_drive(fname):
+                if not _IS_TTY:
+                    ts = time.strftime('%H:%M:%S')
+                    print(f"[{ts}] ⏭️  Skipping (already on Drive): {short_name}", flush=True)
+                completed.add(fname)
+                done_bytes += file_size
+                save_state({
+                    'completed_files':        list(completed),
+                    'current_file':           '',
+                    'current_session_uri':    '',
+                    'current_bytes_uploaded': 0,
+                })
+                progress.commit_file()
+                continue
 
             # Resume within this file if state matches
             session_uri  = ''
@@ -574,11 +621,25 @@ def main():
                     progress.commit_file()
                     continue
                 elif offset is not None and offset > 0:
+                    # Session still alive — resume from Drive's confirmed offset
                     session_uri = current_uri
                     skip_bytes  = offset
                     progress.set_phase(f"⏩ Resuming from {fmt_bytes(skip_bytes)}")
+                elif offset is None:
+                    # Session expired — Drive sessions cannot be transferred to a
+                    # new session URI.  A new session always starts at offset 0.
+                    # We must re-upload the whole file from the beginning.
+                    # (file_exists_on_drive above handles the case where it already
+                    # completed before the script could mark it done.)
+                    if not _IS_TTY:
+                        ts = time.strftime('%H:%M:%S')
+                        print(f"[{ts}] ⚠️  Session expired — restarting file from 0",
+                              flush=True)
+                    session_uri = ''   # fall through to create fresh session below
+                    skip_bytes  = 0
 
             if not session_uri:
+                # Fresh upload — no prior state for this file
                 session_uri = create_session(entry)
                 skip_bytes  = 0
 
@@ -660,8 +721,12 @@ def main():
                                 bytes_sent += chunk_len
                                 uploaded = True
                                 break
-                            send_start = actual
-                            send_data  = chunk_bytes[send_start - bytes_sent:]
+                            # Guard against server returning an offset behind our
+                            # chunk start (should not happen, but prevents a
+                            # Python negative-index slice bug if it ever does).
+                            slice_from = max(0, actual - bytes_sent)
+                            send_start = bytes_sent + slice_from
+                            send_data  = chunk_bytes[slice_from:]
 
                         send_len  = len(send_data)
                         range_end = send_start + send_len - 1
