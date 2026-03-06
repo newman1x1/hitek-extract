@@ -311,6 +311,13 @@ def verify_server_offset(
 
 
 # ════════════════════════════════════════════════════════════════════
+# Detect CI / non-interactive environment once at import time.
+# In CI (GitHub Actions etc.) stdout is not a TTY, so \r does not
+# overwrite the current line — every write becomes a separate log
+# entry, flooding the log with thousands of lines.  In CI mode we
+# print a plain \n line only once per minute.
+_IS_TTY = sys.stdout.isatty() and not os.environ.get('CI')
+
 # REAL-TIME PROGRESS PRINTER — background thread, updates every ~1 s
 # ════════════════════════════════════════════════════════════════════
 class ProgressPrinter:
@@ -353,31 +360,50 @@ class ProgressPrinter:
     def stop(self):
         self._stop = True
         self._thread.join(timeout=2)
-        print()  # newline after last \r line
+        if _IS_TTY:
+            print()  # newline after last \r line
 
     def _run(self):
+        # In CI mode print one plain line per minute; in TTY mode
+        # overwrite the same line every second with \r.
+        interval     = 1.0 if _IS_TTY else 60.0
+        last_printed = 0.0
         while not self._stop:
-            with self._lock:
-                visible   = self._total + self._inflight
-                elapsed   = max(time.time() - self._t_start, 0.001)
-                speed     = (visible - self._base) / elapsed
-                pct       = visible / (TOTAL_SIZE_GB * 1e9) * 100
-                rem       = max(TOTAL_SIZE_GB * 1e9 - visible, 0)
-                eta       = rem / speed if speed > 1 else 0
-                parts_str = (
-                    f"Part {self._part_cur}/{self._part_total}"
-                    if self._part_total else ""
-                )
-                phase    = self._phase
-                speed_mb = speed / 1e6
+            now = time.time()
+            if now - last_printed >= interval:
+                with self._lock:
+                    visible   = self._total + self._inflight
+                    elapsed   = max(now - self._t_start, 0.001)
+                    speed     = (visible - self._base) / elapsed
+                    pct       = visible / (TOTAL_SIZE_GB * 1e9) * 100
+                    rem       = max(TOTAL_SIZE_GB * 1e9 - visible, 0)
+                    eta       = rem / speed if speed > 1 else 0
+                    parts_str = (
+                        f"Part {self._part_cur}/{self._part_total}"
+                        if self._part_total else ""
+                    )
+                    phase    = self._phase
+                    speed_mb = speed / 1e6
 
-            line = (
-                f"\r🚀 {fmt_bytes(visible):>10} ({pct:5.1f}%) │ "
-                f"{speed_mb:6.2f} MB/s │ "
-                f"ETA {fmt_time(eta)} │ "
-                f"{parts_str:<14} │ {phase}          "
-            )
-            print(line, end='', flush=True)
+                if _IS_TTY:
+                    line = (
+                        f"\r🚀 {fmt_bytes(visible):>10} ({pct:5.1f}%) │ "
+                        f"{speed_mb:6.2f} MB/s │ "
+                        f"ETA {fmt_time(eta)} │ "
+                        f"{parts_str:<14} │ {phase}          "
+                    )
+                    print(line, end='', flush=True)
+                else:
+                    # CI mode — plain newline, timestamp prefix
+                    ts = time.strftime('%H:%M:%S')
+                    line = (
+                        f"[{ts}] 🚀 {fmt_bytes(visible):>10} ({pct:5.1f}%) │ "
+                        f"{speed_mb:6.2f} MB/s │ "
+                        f"ETA {fmt_time(eta)} │ "
+                        f"{parts_str:<14} │ {phase}"
+                    )
+                    print(line, flush=True)
+                last_printed = now
             time.sleep(1.0)
 
 
@@ -905,4 +931,3 @@ def main():
 
 if __name__ == '__main__':
     main()
-
