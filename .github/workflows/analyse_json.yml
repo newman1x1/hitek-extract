@@ -1,0 +1,57 @@
+name: Analyse users_data.json
+
+on:
+  workflow_dispatch:
+
+jobs:
+  analyse:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360        # 6-hour cap — analysis of 479 GB takes ~2–3 h
+
+    steps:
+      # ── 1. Checkout ───────────────────────────────────────────────
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ── 2. Python ─────────────────────────────────────────────────
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      # ── 3. System dependencies  (rclone + FUSE3) ──────────────────
+      - name: Install rclone and fuse3
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y fuse3
+          curl -fsSL https://rclone.org/install.sh | sudo bash
+          rclone version
+
+      # ── 4. Python dependencies ────────────────────────────────────
+      - name: Install Python packages
+        run: pip install requests ijson
+
+      # ── 5. rclone config from repository secret ───────────────────
+      - name: Configure rclone
+        env:
+          RCLONE_CONF: ${{ secrets.RCLONE_CONF }}     # base64-encoded rclone.conf
+        run: |
+          mkdir -p ~/.config/rclone
+          echo "$RCLONE_CONF" | base64 -d > ~/.config/rclone/rclone.conf
+          echo "✅ rclone config written"
+          rclone listremotes
+
+      # ── 6. Run analysis ───────────────────────────────────────────
+      - name: Analyse users_data.json
+        run: python3 analyse_json.py
+
+      # ── 7. Upload reports as downloadable artifacts ───────────────
+      - name: Upload analysis reports
+        if: always()     # upload even if the step above timed out / errored
+        uses: actions/upload-artifact@v4
+        with:
+          name: json-analysis-report
+          path: |
+            json_analysis_report.json
+            json_analysis_report.txt
+          retention-days: 90
