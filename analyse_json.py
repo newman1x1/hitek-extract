@@ -2,9 +2,12 @@
 """
 ═══════════════════════════════════════════════════════════════════════
   JSON ANALYSER  —  zero-download, fully-streaming edition
-  Runs on GitHub Actions (Ubuntu) or any machine with rclone + fuse3
+  Runs on GitHub Actions (Ubuntu) or any machine with rclone
 
-  Pipeline:  rclone mount (read-only) → ijson stream → stats tree → report
+  Pipeline:  rclone cat (single HTTP stream) → ijson pipe → stats tree → report
+
+  NO FUSE MOUNT.  rclone cat downloads straight into this process via a pipe
+  at 50–100 MB/s.  FUSE VFS was causing ~9 MB/s due to per-read HTTP requests.
 
   What it produces
   ────────────────────────────────────────────────────────────────────
@@ -23,7 +26,7 @@
 
   Runtime estimate on GitHub Actions
   ────────────────────────────────────────────────────────────────────
-  479 GB file, FUSE read ~40–60 MB/s → ~2.0–3.3 h, well within 6 h.
+  479 GB file, rclone cat ~60–100 MB/s → ~1.5–2.5 h, well within 6 h.
 ═══════════════════════════════════════════════════════════════════════
 """
 
@@ -32,7 +35,7 @@
 # dependencies = ["ijson>=3.2"]
 # ///
 
-import os, sys, json, time, re, subprocess, collections
+import os, sys, json, time, re, signal, subprocess, threading, collections, io, math
 from datetime import datetime, timezone
 
 # ── auto-install dependencies ─────────────────────────────────────────────────
@@ -45,6 +48,10 @@ except ImportError:
     print("📦 Installing ijson…"); _pip('ijson')
     import ijson
 
+# Replaced in main() with the specific C backend module when available.
+# run_analysis() uses _ijson so the backend choice is actually enforced.
+_ijson = ijson
+
 
 # ════════════════════════════════════════════════════════════════════════════════
 # CONFIGURATION
@@ -56,11 +63,11 @@ FILE_NAME      = 'users_data.json'
 REPORT_JSON    = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'json_analysis_report.json')
 REPORT_TXT     = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'json_analysis_report.txt')
 
-MAX_DEPTH      = 6      # max nesting depth to recurse into
-MAX_SAMPLES    = 25     # unique sample values kept per field
-MAX_TOP_VALUES = 200    # top-N frequent values tracked per field (Counter cap)
-LOG_INTERVAL   = 60     # seconds between progress lines in CI
-SAVE_EVERY     = 0      # save partial report every N records (0 = only at end)
+MAX_DEPTH             = 6     # max nesting depth to recurse into
+MAX_SAMPLES           = 25    # unique sample values kept per field
+MAX_TOP_VALUES        = 200   # top-N frequent values tracked per field (Counter cap)
+MAX_CHILDREN_PER_DEPTH = 500  # max unique keys tracked per object node (memory guard)
+LOG_INTERVAL          = 60    # seconds between progress lines in CI
 
 # ════════════════════════════════════════════════════════════════════════════════
 # HELPERS
@@ -97,6 +104,40 @@ def find_rclone() -> str:
             pass
     print('❌ rclone not found. Install: https://rclone.org/install/')
     sys.exit(1)
+
+
+def _read_up_to(stream, n: int) -> bytes:
+    """
+    Read exactly n bytes from a pipe stream, retrying until n bytes or EOF.
+
+    A single pipe_stream.read(n) on a raw OS pipe (bufsize=0 FileIO) returns
+    only what is currently in the kernel pipe buffer — often much fewer than
+    n bytes when the producer (rclone) has only just started writing.  This
+    retry loop guarantees enough bytes are available to reliably detect the
+    JSON top-level structure before handing control to ijson.
+    """
+    buf = b''
+    while len(buf) < n:
+        chunk = stream.read(n - len(buf))
+        if not chunk:   # EOF or closed pipe
+            break
+        buf += chunk
+    return buf
+
+
+def get_file_size(rclone_cmd: str) -> int:
+    """Query the remote for file size without downloading."""
+    try:
+        r = subprocess.run(
+            [rclone_cmd, 'size', '--json',
+             f'{RCLONE_REMOTE}:{SOURCE_FOLDER}/{FILE_NAME}'],
+            capture_output=True, text=True, timeout=60,
+        )
+        if r.returncode == 0:
+            return json.loads(r.stdout).get('bytes', 0)
+    except Exception:
+        pass
+    return 0
 
 
 # ════════════════════════════════════════════════════════════════════════════════
@@ -203,8 +244,16 @@ def analyse_value(node: dict, value, depth: int = 0) -> None:
         tc['object'] = tc.get('object', 0) + 1
         if depth < MAX_DEPTH:
             for k, v in value.items():
-                child = node['children'].setdefault(str(k), new_field())
-                analyse_value(child, v, depth + 1)
+                key = str(k)
+                # Once the cap is reached, skip NEW keys but continue updating
+                # already-tracked ones.  Using break here would give different
+                # records different key subsets, producing artifically low
+                # presence_rate values for keys beyond position 500.
+                if key not in node['children']:
+                    if len(node['children']) >= MAX_CHILDREN_PER_DEPTH:
+                        continue
+                    node['children'][key] = new_field()
+                analyse_value(node['children'][key], v, depth + 1)
         return
 
     # ── fallback (bytes, etc.) ────────────────────────────────────
@@ -298,17 +347,78 @@ def serialise_node(node: dict, total_records: int) -> dict:
 
 
 # ════════════════════════════════════════════════════════════════════════════════
-# STREAMING ANALYSIS
+# STREAMING ANALYSIS  —  reads from a raw byte stream (rclone cat pipe)
 # ════════════════════════════════════════════════════════════════════════════════
-def detect_top_level(path: str) -> tuple[str, str]:
-    """
-    Peek at the first non-whitespace character to determine structure.
-    Returns ('array', 'item') or ('object', '<key>') for ijson prefix.
-    """
-    with open(path, 'rb') as f:
-        chunk = f.read(65536)
 
-    stripped = chunk.lstrip()
+class _CountingStream(io.RawIOBase):
+    """
+    Wraps a raw binary pipe and counts bytes consumed.
+
+    Inherits from io.RawIOBase so that C-extension ijson backends (yajl2_c,
+    yajl2_cffi) accept it without silently falling back to a Python-side read
+    loop.  Both read() and readinto() are implemented: some C backends call
+    read(), others call readinto() for zero-copy efficiency; either way
+    bytes_read is updated accurately so progress percentages are correct.
+
+    NOTE: __slots__ still works with io.RawIOBase (a C type) — Python will
+    create slots for _src and bytes_read and suppress __dict__ on instances.
+    """
+    __slots__ = ('_src', 'bytes_read')
+
+    def __init__(self, src):
+        super().__init__()
+        self._src       = src
+        self.bytes_read = 0
+
+    def readable(self) -> bool:
+        return True
+
+    def read(self, n: int = -1) -> bytes:
+        chunk = self._src.read(n)
+        if chunk:
+            self.bytes_read += len(chunk)
+        return chunk or b''
+
+    def readinto(self, b) -> int:
+        """Called by some C backends instead of read() for zero-copy efficiency."""
+        data = self._src.read(len(b))
+        n = len(data)
+        if n:
+            b[:n] = data
+            self.bytes_read += n
+        return n
+
+
+class _PrependStream:
+    """
+    Concatenates a bytes header with a tail stream so ijson sees one stream.
+    Necessary because we peeked at the first 65536 bytes to detect structure.
+    """
+    __slots__ = ('_buf', '_tail')
+
+    def __init__(self, head: bytes, tail):
+        self._buf  = head
+        self._tail = tail
+
+    def read(self, n: int = -1) -> bytes:
+        if self._buf:
+            if n < 0 or n >= len(self._buf):
+                out        = self._buf
+                self._buf  = b''
+                rest       = self._tail.read() if n < 0 else self._tail.read(n - len(out))
+                return out + rest
+            out       = self._buf[:n]
+            self._buf = self._buf[n:]
+            return out
+        return self._tail.read(n)
+
+
+def detect_top_level_from_bytes(header: bytes) -> tuple[str, str]:
+    """
+    Inspect the first bytes of the stream to determine JSON structure.
+    Returns ('array', 'item'), ('object', '<key>.item'), or ('object', '').
+    """
+    stripped = header.lstrip()
     if not stripped:
         return ('unknown', '')
 
@@ -316,10 +426,15 @@ def detect_top_level(path: str) -> tuple[str, str]:
         return ('array', 'item')
 
     if stripped[0:1] == b'{':
-        # Try to find the first array value inside the object
         try:
             partial = stripped.decode('utf-8', errors='replace')
-            # Look for pattern like  "somekey": [
+            # Prefer a key whose array is non-empty (has content after '[').
+            # This avoids picking a metadata/empty array like "tags": [] when
+            # the real records array "users": [{...}] appears later.
+            m = re.search(r'"([^"]+)"\s*:\s*\[\s*\S', partial)
+            if m:
+                return ('object', m.group(1) + '.item')
+            # Fall back: first array-valued key regardless of content.
             m = re.search(r'"([^"]+)"\s*:\s*\[', partial)
             if m:
                 return ('object', m.group(1) + '.item')
@@ -330,99 +445,142 @@ def detect_top_level(path: str) -> tuple[str, str]:
     return ('unknown', '')
 
 
-def run_analysis(file_path: str) -> dict:
+def run_analysis(pipe_stream, file_size: int) -> dict:
     """
-    Stream-parse file_path with ijson and return a raw schema tree + metadata.
+    Stream-parse bytes from pipe_stream (rclone cat stdout) with ijson.
+    file_size is used only for progress percentage / ETA display.
     """
-    file_size = os.path.getsize(file_path)
-    log(f'📄 File size on disk: {fmt_bytes(file_size)}')
+    # Peek at first 64 KB to detect structure, then prepend back.
+    # Use _read_up_to instead of a single read(): a raw OS pipe returns only
+    # what is currently buffered -- often far fewer than 65536 bytes when
+    # rclone has just started.  The retry loop guarantees enough context for
+    # detect_top_level_from_bytes to work correctly.
+    header    = _read_up_to(pipe_stream, 65536)
+    top_level, prefix = detect_top_level_from_bytes(header)
+    if top_level == 'unknown':
+        log(f'\u26a0\ufe0f  Unrecognised top-level JSON structure.')
+        log(f'   First bytes: {header[:64]!r}')
+        log('   Expected "[" (array) or "{" (object). Check RCLONE_REMOTE config.')
+    log(f'\U0001f50d Top-level structure: {top_level}  |  ijson prefix: "{prefix}"')
 
-    top_level, prefix = detect_top_level(file_path)
-    log(f'🔍 Top-level structure: {top_level}  |  ijson prefix: "{prefix}"')
+    counter = _CountingStream(_PrependStream(header, pipe_stream))
+    # bytes_read is already 0 from __init__.  The header is replayed through
+    # _PrependStream so the counter correctly tracks total bytes consumed from
+    # the very start of the JSON file (header bytes + remainder).
 
-    root = new_field()         # schema root (top-level record fields go here)
-    record_count   = 0
-    start_time     = time.time()
-    last_log_time  = start_time
+    root          = new_field()
+    record_count  = 0
+    start_time    = time.time()
+    last_log_time = start_time
 
-    with open(file_path, 'rb') as fh:
-        # ── array of records (most common for user data) ──────────
+    def _items(pfx):
+        try:
+            return _ijson.items(counter, pfx, use_float=True)
+        except TypeError:
+            return _ijson.items(counter, pfx)
+
+    def _kvitems():
+        try:
+            return _ijson.kvitems(counter, '', use_float=True)
+        except TypeError:
+            return _ijson.kvitems(counter, '')
+
+    def _log_progress():
+        nonlocal last_log_time
+        now = time.time()
+        if now - last_log_time < LOG_INTERVAL:
+            return
+        elapsed = now - start_time
+        pos     = counter.bytes_read
+        pct     = pos / file_size * 100 if file_size else 0
+        speed   = pos / elapsed if elapsed else 0
+        eta     = (file_size - pos) / speed if speed else 0
+        last_log_time = now
+        log(f'  ⏳ {fmt_num(record_count)} records  '
+            f'{pct:.1f}%  '
+            f'{fmt_bytes(pos)} / {fmt_bytes(file_size)}  '
+            f'@ {fmt_bytes(speed)}/s  '
+            f'ETA {fmt_dur(eta)}')
+
+    parse_error: str | None = None
+    interrupted: bool       = False
+    try:
         if top_level == 'array' or (top_level == 'object' and '.' in prefix):
-            try:
-                parser = ijson.items(fh, prefix, use_float=True)
-            except TypeError:
-                # older ijson without use_float
-                parser = ijson.items(fh, prefix)
-
-            for record in parser:
+            for record in _items(prefix):
                 record_count += 1
-
                 if isinstance(record, dict):
                     for k, v in record.items():
-                        child = root['children'].setdefault(str(k), new_field())
-                        analyse_value(child, v, depth=1)
+                        analyse_value(root['children'].setdefault(str(k), new_field()), v, 1)
                     root['seen'] += 1
                 else:
-                    # array of scalars / mixed
-                    analyse_value(root, record, depth=0)
-
-                # ── progress logging ──────────────────────────────
-                now = time.time()
-                if now - last_log_time >= LOG_INTERVAL:
-                    elapsed  = now - start_time
-                    pos      = fh.tell()
-                    pct      = pos / file_size * 100 if file_size else 0
-                    speed    = pos / elapsed if elapsed else 0
-                    eta      = (file_size - pos) / speed if speed else 0
-                    last_log_time = now
-                    log(f'  ⏳ {fmt_num(record_count)} records  '
-                        f'{pct:.1f}%  '
-                        f'{fmt_bytes(pos)} / {fmt_bytes(file_size)}  '
-                        f'@ {fmt_bytes(speed)}/s  '
-                        f'ETA {fmt_dur(eta)}')
-
-        # ── single top-level object (not an array) ────────────────
+                    analyse_value(root, record, 0)
+                _log_progress()
         else:
-            try:
-                parser = ijson.kvitems(fh, '', use_float=True)
-            except TypeError:
-                parser = ijson.kvitems(fh, '')
-
-            for key, value in parser:
+            for key, value in _kvitems():
                 record_count += 1
-                child = root['children'].setdefault(str(key), new_field())
-                analyse_value(child, value, depth=1)
+                analyse_value(root['children'].setdefault(str(key), new_field()), value, 1)
                 root['seen'] = record_count
-
-                now = time.time()
-                if now - last_log_time >= LOG_INTERVAL:
-                    elapsed = now - start_time
-                    pos     = fh.tell()
-                    pct     = pos / file_size * 100 if file_size else 0
-                    speed   = pos / elapsed if elapsed else 0
-                    eta     = (file_size - pos) / speed if speed else 0
-                    last_log_time = now
-                    log(f'  ⏳ {fmt_num(record_count)} top-level keys  '
-                        f'{pct:.1f}%  {fmt_bytes(pos)} / {fmt_bytes(file_size)}  '
-                        f'@ {fmt_bytes(speed)}/s  ETA {fmt_dur(eta)}')
+                _log_progress()
+    except Exception as exc:
+        # Catch all parse/backend errors, not just ijson.JSONError: when _ijson
+        # is set to a specific backend module (yajl2_cffi, yajl2_c), it may raise
+        # a backend-local JSONError subclass that isn't reachable via ijson.JSONError.
+        # PARTIAL DATA: a parse error after N records must not discard everything.
+        parse_error = str(exc)
+        log(f'⚠️  JSON parse error after {fmt_num(record_count)} records: {exc}')
+        log('   Saving partial report with data collected so far…')
+    except (KeyboardInterrupt, SystemExit):
+        # Ctrl-C or SIGTERM (converted to SystemExit by the signal handler in
+        # main).  Do NOT re-raise: fall through so run_analysis returns partial
+        # data and the caller can save a report before exiting.
+        interrupted = True
+        log(f'\n⚠️  Interrupted after {fmt_num(record_count)} records'
+            f' — saving partial report…')
 
     elapsed    = time.time() - start_time
-    throughput = file_size / elapsed if elapsed else 0
+    total_read = counter.bytes_read
+    throughput = total_read / elapsed if elapsed else 0
 
-    return {
-        '_root':          root,
-        'record_count':   record_count,
-        'top_level_type': top_level,
-        'ijson_prefix':   prefix,
+    result = {
+        '_root':           root,
+        'record_count':    record_count,
+        'top_level_type':  top_level,
+        'ijson_prefix':    prefix,
         'file_size_bytes': file_size,
+        'bytes_consumed':  total_read,
         'elapsed_seconds': round(elapsed, 1),
         'throughput_bps':  round(throughput, 1),
     }
+    if parse_error is not None:
+        result['parse_error'] = parse_error
+        result['partial']     = True
+    if interrupted:
+        result['interrupted'] = True
+        result['partial']     = True
+    return result
 
 
 # ════════════════════════════════════════════════════════════════════════════════
 # REPORT GENERATION
 # ════════════════════════════════════════════════════════════════════════════════
+def _sanitise_for_json(obj):
+    """
+    Recursively replace float('inf') / float('nan') / float('-inf') with None.
+
+    json.dump() raises ValueError for these even when default=str is set,
+    because default= only handles *unknown types*, not built-in floats.
+    These values can enter the schema tree through _update_minmax() when the
+    source JSON contains non-finite numbers or when use_float=True is active.
+    """
+    if isinstance(obj, float):
+        return None if not math.isfinite(obj) else obj
+    if isinstance(obj, dict):
+        return {k: _sanitise_for_json(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_sanitise_for_json(v) for v in obj]
+    return obj
+
+
 def build_report(raw: dict) -> dict:
     root         = raw['_root']
     total        = raw['record_count']
@@ -453,6 +611,9 @@ def build_report(raw: dict) -> dict:
         'throughput_human':  fmt_bytes(throughput) + '/s',
         'field_count':       len(schema),
         'schema':            schema,
+        **({'WARNING':      f'PARTIAL DATA — JSON parse error: {raw["parse_error"]}',
+             'partial':     True}
+           if raw.get('partial') else {}),
     }
 
 
@@ -491,7 +652,7 @@ def render_txt(report: dict) -> str:
         null_r = fdata.get('null_rate', 0)
 
         type_str = ', '.join(f'{k}:{v}' for k, v in sorted(tc.items(), key=lambda x: -x[1]))
-        lines.append(f'')
+        lines.append('')
         lines.append(f'{pad}{prefix}◆ {name}')
         lines.append(f'{pad}   presence : {pres*100:.1f}%  (seen {fmt_num(fdata["seen"])} times)')
         lines.append(f'{pad}   types    : {type_str}')
@@ -520,10 +681,13 @@ def render_txt(report: dict) -> str:
 
         if fdata.get('top_values'):
             top = fdata['top_values']
-            satd = ' [counter full, values may be incomplete]' if fdata.get('counter_saturated') else ''
+            saturated = fdata.get('counter_saturated', False)
+            satd = ' [counter full — more values exist]' if saturated else ''
             top_str = '  |  '.join(f'"{k}"={v}' for k, v in list(top.items())[:5])
             lines.append(f'{pad}   top vals : {top_str}{satd}')
-            lines.append(f'{pad}   est. uniq: ≥{fmt_num(fdata.get("estimated_unique", 0))}')
+            uniq = fdata.get('estimated_unique', 0)
+            uniq_str = f'≥{fmt_num(uniq)}' if saturated else fmt_num(uniq)
+            lines.append(f'{pad}   est. uniq: {uniq_str}')
 
         # recurse into children
         for child_name, child_data in fdata.get('children', {}).items():
@@ -540,85 +704,89 @@ def render_txt(report: dict) -> str:
 
 
 # ════════════════════════════════════════════════════════════════════════════════
-# RCLONE MOUNT
+# RCLONE CAT  —  single HTTP stream, no FUSE, ~60-100 MB/s
 # ════════════════════════════════════════════════════════════════════════════════
-def mount_and_analyse(rclone_cmd: str) -> dict:
-    mount_dir = os.path.join(
-        os.path.dirname(os.path.abspath(__file__)), '_analyse_mount'
-    )
+def stream_and_analyse(rclone_cmd: str) -> dict:
+    """
+    Launch  rclone cat  and pipe its stdout directly into run_analysis.
+    One continuous HTTP stream — no FUSE, no kernel round trips.
+    """
+    remote_path = f'{RCLONE_REMOTE}:{SOURCE_FOLDER}/{FILE_NAME}'
 
-    if sys.platform == 'win32':
-        if os.path.isdir(mount_dir):
-            try:
-                os.rmdir(mount_dir)
-            except OSError:
-                import shutil
-                shutil.rmtree(mount_dir, ignore_errors=True)
+    log(f'\n📐 Querying file size for {remote_path} …')
+    file_size = get_file_size(rclone_cmd)
+    if file_size:
+        log(f'   {fmt_bytes(file_size)}')
     else:
-        os.makedirs(mount_dir, exist_ok=True)
+        log('   (size unavailable — % and ETA will show 0)')
 
-    log(f'\n🗂️  Mounting {RCLONE_REMOTE}:{SOURCE_FOLDER} → {mount_dir} …')
-    mount_proc = subprocess.Popen(
+    log(f'\n▶️  Streaming via rclone cat …')
+
+    # Drain rclone stderr continuously in a background thread.
+    # Without this the 64 KB OS pipe buffer fills, rclone blocks inside write(),
+    # nothing arrives on stdout, and Python blocks in ijson — deadlock.
+    # The thread is daemon so it never prevents the process from exiting.
+    _stderr_chunks: list[bytes] = []
+
+    proc = subprocess.Popen(
         [
-            rclone_cmd, 'mount',
-            f'{RCLONE_REMOTE}:{SOURCE_FOLDER}',
-            mount_dir,
-            '--vfs-cache-mode', 'off',
-            '--read-only',
-            '--no-modtime',
-            '--dir-cache-time', '5m',
-            '--buffer-size',    '256M',   # FUSE read-ahead buffer
-            '--vfs-read-ahead', '512M',   # sequential prefetch window
-            '--log-level', 'ERROR',
+            rclone_cmd, 'cat',
+            remote_path,
+            '--buffer-size', '256M',
+            # NOTE: --drive-chunk-size controls multipart UPLOAD chunk size and
+            # is silently ignored (or may error on newer rclone) for cat/reads.
         ],
-        stdout=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
+        bufsize=0,
     )
 
-    def cleanup():
-        log('🧹 Unmounting…')
-        mount_proc.terminate()
-        time.sleep(1)
-        if sys.platform == 'win32':
-            subprocess.run(['taskkill', '/F', '/PID', str(mount_proc.pid)],
-                           capture_output=True)
-        else:
-            for fm in ['fusermount3', 'fusermount']:
-                try:
-                    r = subprocess.run([fm, '-uz', mount_dir],
-                                       capture_output=True, timeout=10)
-                    if r.returncode == 0:
-                        break
-                except Exception:
-                    continue
+    def _drain_stderr():
         try:
-            os.rmdir(mount_dir)
+            while True:
+                chunk = proc.stderr.read(4096)
+                if not chunk:
+                    break
+                _stderr_chunks.append(chunk)
         except Exception:
             pass
 
-    json_path = os.path.join(mount_dir, FILE_NAME)
-    log('   Waiting for mount…')
-    for _ in range(60):
-        if os.path.exists(json_path):
-            break
-        if mount_proc.poll() is not None:
-            err = mount_proc.stderr.read().decode(errors='replace').strip()
-            log(f'❌ rclone mount failed: {err}')
-            if sys.platform != 'win32':
-                log('   Ensure fuse3 is installed:  sudo apt-get install -y fuse3')
-            sys.exit(1)
-        print('.', end='', flush=True)
-        time.sleep(2)
-    else:
-        cleanup()
-        log(f'\n❌ Timed out — {FILE_NAME} not visible at {json_path}')
-        sys.exit(1)
-    log('  ✅ Mounted')
+    _stderr_thread = threading.Thread(target=_drain_stderr, daemon=True)
+    _stderr_thread.start()
 
     try:
-        raw = run_analysis(json_path)
+        raw = run_analysis(proc.stdout, file_size)
+    except Exception:
+        proc.kill()
+        raise
     finally:
-        cleanup()
+        try:
+            proc.stdout.close()
+        except Exception:
+            pass
+        try:
+            proc.wait(timeout=30)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            try:
+                proc.wait(timeout=5)   # reap zombie after SIGKILL
+            except Exception:
+                pass
+        except Exception:
+            pass
+        _stderr_thread.join(timeout=5)
+
+    # rclone returns 0 even when the consumer closes the pipe (SIGPIPE/exit 141).
+    # Suppress -SIGPIPE so an interrupted-but-successful run looks clean.
+    _sigpipe_code = getattr(signal, 'SIGPIPE', None)
+    _ok_returncodes = {0}
+    if _sigpipe_code is not None:
+        _ok_returncodes.add(-_sigpipe_code)   # typically -13 on Linux
+    if proc.returncode not in _ok_returncodes:
+        # Genuine rclone-level error — log captured stderr for diagnosis.
+        err = b''.join(_stderr_chunks).decode(errors='replace').strip()
+        if err:
+            log(f'⚠️  rclone cat exited {proc.returncode}: {err[:500]}')
 
     return raw
 
@@ -636,11 +804,52 @@ def main():
 
     rclone_cmd = find_rclone()
 
-    raw_stats = mount_and_analyse(rclone_cmd)
+    # Convert SIGTERM to SystemExit so the finally blocks in stream_and_analyse
+    # and run_analysis fire and the partial report is saved before exit.
+    # GitHub Actions sends SIGTERM when the 6-hour job timeout is reached.
+    def _on_sigterm(signum, _frame):
+        log('\n\u26a0\ufe0f  SIGTERM received \u2014 saving partial report before exit\u2026')
+        raise SystemExit(128 + signum)
+    if hasattr(signal, 'SIGTERM'):
+        signal.signal(signal.SIGTERM, _on_sigterm)
 
-    if not raw_stats or raw_stats['record_count'] == 0:
-        log('No data collected — exiting.')
+    # Enforce the fastest available C backend rather than just logging it.
+    # Importing the backend module and calling _ijson.items() directly is the
+    # only reliable way to guarantee which backend is used.  The module-level
+    # ijson.items() auto-selects at import time and the log message below could
+    # say “yajl2_cffi active” while ijson.items() silently uses something else.
+    global _ijson
+    try:
+        import ijson.backends.yajl2_cffi as _ijson_backend
+        _ijson = _ijson_backend
+        log(f'⚡ ijson C backend (yajl2_cffi) enforced  '
+            f'[ijson.backend={getattr(ijson, "backend", "?")!r}]')
+    except ImportError:
+        try:
+            import ijson.backends.yajl2_c as _ijson_backend
+            _ijson = _ijson_backend
+            log(f'⚡ ijson C backend (yajl2_c) enforced  '
+                f'[ijson.backend={getattr(ijson, "backend", "?")!r}]')
+        except ImportError:
+            log(f'⚠️  ijson pure-Python backend active  '
+                f'[ijson.backend={getattr(ijson, "backend", "?")!r}]  '
+                f'— install yajl2 for ~3× speedup')
+
+    raw_stats = stream_and_analyse(rclone_cmd)
+
+    if not raw_stats or (raw_stats['record_count'] == 0
+                          and not raw_stats.get('partial')
+                          and not raw_stats.get('interrupted')):
+        log('No data collected \u2014 exiting.')
         sys.exit(1)
+
+    if raw_stats.get('interrupted'):
+        log(f'\u26a0\ufe0f  Run was interrupted after {fmt_num(raw_stats["record_count"])} records.')
+        log('   Partial report will be saved.')
+    elif raw_stats.get('partial'):
+        log(f'\u26a0\ufe0f  PARTIAL DATA — JSON parse error interrupted the stream.')
+        log(f'   Records collected before error: {fmt_num(raw_stats["record_count"])}')
+        log(f'   Error: {raw_stats["parse_error"]}')
 
     record_count = raw_stats['record_count']
     elapsed      = raw_stats['elapsed_seconds']
@@ -657,7 +866,7 @@ def main():
 
     # ── save JSON report ──────────────────────────────────────────
     with open(REPORT_JSON, 'w', encoding='utf-8') as f:
-        json.dump(report, f, indent=2, default=str, ensure_ascii=False)
+        json.dump(_sanitise_for_json(report), f, indent=2, default=str, ensure_ascii=False)
     log(f'   💾 {REPORT_JSON}  ({fmt_bytes(os.path.getsize(REPORT_JSON))})')
 
     # ── save text report ─────────────────────────────────────────
@@ -671,6 +880,9 @@ def main():
     print(txt)
 
     log('')
+    if raw_stats.get('interrupted'):
+        log('⚠️  Analysis was interrupted — partial report saved.')
+        sys.exit(130)   # conventional: 128 + SIGINT(2)
     log('🎉 Analysis complete!')
 
 
