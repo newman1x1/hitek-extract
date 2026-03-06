@@ -819,21 +819,24 @@ def main():
     # ijson.items() auto-selects at import time and the log message below could
     # say “yajl2_cffi active” while ijson.items() silently uses something else.
     global _ijson
+    # yajl2_c  — fastest: native C extension, links against libyajl2 at runtime
+    # yajl2_cffi — CFFI wrapper, slightly slower but more portable
+    # Both ship inside the ijson package; no separate PyPI package needed.
     try:
-        import ijson.backends.yajl2_cffi as _ijson_backend
+        import ijson.backends.yajl2_c as _ijson_backend
         _ijson = _ijson_backend
-        log(f'⚡ ijson C backend (yajl2_cffi) enforced  '
+        log(f'⚡ ijson backend: yajl2_c (fastest C extension)  '
             f'[ijson.backend={getattr(ijson, "backend", "?")!r}]')
     except ImportError:
         try:
-            import ijson.backends.yajl2_c as _ijson_backend
+            import ijson.backends.yajl2_cffi as _ijson_backend
             _ijson = _ijson_backend
-            log(f'⚡ ijson C backend (yajl2_c) enforced  '
+            log(f'⚡ ijson backend: yajl2_cffi (CFFI wrapper)  '
                 f'[ijson.backend={getattr(ijson, "backend", "?")!r}]')
         except ImportError:
             log(f'⚠️  ijson pure-Python backend active  '
                 f'[ijson.backend={getattr(ijson, "backend", "?")!r}]  '
-                f'— install yajl2 for ~3× speedup')
+                f'— ensure libyajl2 is installed for ~3× speedup')
 
     raw_stats = stream_and_analyse(rclone_cmd)
 
