@@ -206,8 +206,12 @@ def load_state() -> dict:
 # SERVER OFFSET VERIFICATION
 # Returns: int≥0 (bytes received), -1 (complete), None (session dead)
 # ════════════════════════════════════════════════════════════════════
-def verify_server_offset(sess, uri: str, token_mgr: TokenManager):
-    for attempt in range(30):
+def verify_server_offset(
+    sess, uri: str, token_mgr: TokenManager,
+    expected_total: int = 0,
+):
+    # 10 attempts is plenty; 30 × 120 s = 56-minute freeze is too long.
+    for attempt in range(10):
         try:
             r = sess.put(
                 uri,
@@ -220,7 +224,13 @@ def verify_server_offset(sess, uri: str, token_mgr: TokenManager):
             )
             if r.status_code == 308:
                 rang = r.headers.get('Range', '')
-                return int(rang.split('-')[1]) + 1 if rang else 0
+                if rang:
+                    offset = int(rang.split('-')[1]) + 1
+                    # Drive confirmed it has every byte — treat as complete.
+                    if expected_total and offset >= expected_total:
+                        return -1
+                    return offset
+                return 0
             elif r.status_code in (200, 201):
                 return -1
             elif r.status_code == 401:
@@ -607,7 +617,12 @@ def main():
                     if chunk_len == 0:
                         break
 
-                    is_last = (bytes_sent + chunk_len) >= file_size
+                    # Detect end-of-stream by actual read size, not metadata.
+                    # entry.file_size can differ from actual decompressed bytes
+                    # (zip64 rounding, streaming zip, etc.).  If we use
+                    # file_size as the Content-Range total and it's wrong,
+                    # Drive rejects the request silently.
+                    is_last = chunk_len < CHUNK_SIZE
 
                     # Upload this chunk with retries
                     uploaded = False
@@ -617,7 +632,10 @@ def main():
                             send_data  = chunk_bytes
                         else:
                             progress.set_phase(f"🔍 Verifying offset (try {attempt+1})")
-                            actual = verify_server_offset(sess, session_uri, token_mgr)
+                            actual_total = bytes_sent + chunk_len if is_last else 0
+                            actual = verify_server_offset(
+                                sess, session_uri, token_mgr, actual_total
+                            )
                             if actual == -1:
                                 bytes_sent += chunk_len
                                 uploaded = True
@@ -648,7 +666,9 @@ def main():
                         send_len  = len(send_data)
                         range_end = send_start + send_len - 1
                         if is_last:
-                            content_range = f'bytes {send_start}-{range_end}/{file_size}'
+                            # Use actual byte total, not zip metadata file_size.
+                            actual_total = bytes_sent + chunk_len
+                            content_range = f'bytes {send_start}-{range_end}/{actual_total}'
                         else:
                             content_range = f'bytes {send_start}-{range_end}/*'
 
