@@ -29,24 +29,15 @@
 
 # /// script
 # requires-python = ">=3.10"
-# dependencies = ["requests>=2.31", "ijson>=3.2"]
+# dependencies = ["ijson>=3.2"]
 # ///
 
-import os, sys, json, time, math, signal, subprocess, threading, platform
-import collections
+import os, sys, json, time, re, subprocess, collections
 from datetime import datetime, timezone
 
 # ── auto-install dependencies ─────────────────────────────────────────────────
 def _pip(*pkgs):
     subprocess.check_call([sys.executable, '-m', 'pip', 'install', '-q', *pkgs])
-
-try:
-    import requests
-    from requests.adapters import HTTPAdapter
-except ImportError:
-    print("📦 Installing requests…"); _pip('requests')
-    import requests
-    from requests.adapters import HTTPAdapter
 
 try:
     import ijson
@@ -329,7 +320,6 @@ def detect_top_level(path: str) -> tuple[str, str]:
         try:
             partial = stripped.decode('utf-8', errors='replace')
             # Look for pattern like  "somekey": [
-            import re
             m = re.search(r'"([^"]+)"\s*:\s*\[', partial)
             if m:
                 return ('object', m.group(1) + '.item')
@@ -352,10 +342,8 @@ def run_analysis(file_path: str) -> dict:
 
     root = new_field()         # schema root (top-level record fields go here)
     record_count   = 0
-    bytes_read_est = 0
     start_time     = time.time()
     last_log_time  = start_time
-    last_save_time = start_time
 
     with open(file_path, 'rb') as fh:
         # ── array of records (most common for user data) ──────────
@@ -418,9 +406,8 @@ def run_analysis(file_path: str) -> dict:
                         f'{pct:.1f}%  {fmt_bytes(pos)} / {fmt_bytes(file_size)}  '
                         f'@ {fmt_bytes(speed)}/s  ETA {fmt_dur(eta)}')
 
-    elapsed     = time.time() - start_time
-    final_pos   = file_size
-    throughput  = file_size / elapsed if elapsed else 0
+    elapsed    = time.time() - start_time
+    throughput = file_size / elapsed if elapsed else 0
 
     return {
         '_root':          root,
@@ -478,7 +465,7 @@ def render_txt(report: dict) -> str:
 
     def hr(char='═'): lines.append(char * W)
     def h1(t):        hr(); lines.append(f'  {t}'); hr()
-    def h2(t):        lines.append(''); lines.append(f'── {t} ' + '─' * (W - 4 - len(t)))
+    def h2(t):        lines.append(''); lines.append(f'── {t} ' + '─' * max(0, W - 4 - len(t)))
     def row(k, v):    lines.append(f'  {k:<38} {v}')
 
     h1('JSON STRUCTURE ANALYSIS REPORT')
@@ -500,7 +487,6 @@ def render_txt(report: dict) -> str:
         pad    = '  ' * indent
         prefix = '├─ ' if indent > 0 else ''
         tc     = fdata.get('type_counts', {})
-        dom    = fdata.get('dominant_type', '?')
         pres   = fdata.get('presence_rate', 0)
         null_r = fdata.get('null_rate', 0)
 
@@ -611,7 +597,7 @@ def mount_and_analyse(rclone_cmd: str) -> dict:
             pass
 
     json_path = os.path.join(mount_dir, FILE_NAME)
-    log('   Waiting for mount…', )
+    log('   Waiting for mount…')
     for _ in range(60):
         if os.path.exists(json_path):
             break
@@ -631,9 +617,6 @@ def mount_and_analyse(rclone_cmd: str) -> dict:
 
     try:
         raw = run_analysis(json_path)
-    except KeyboardInterrupt:
-        log('\n⚠️  Interrupted — saving partial report…')
-        raise
     finally:
         cleanup()
 
@@ -653,13 +636,11 @@ def main():
 
     rclone_cmd = find_rclone()
 
-    raw_stats = None
-    try:
-        raw_stats = mount_and_analyse(rclone_cmd)
-    except KeyboardInterrupt:
-        if raw_stats is None:
-            log('No data collected — exiting.')
-            sys.exit(1)
+    raw_stats = mount_and_analyse(rclone_cmd)
+
+    if not raw_stats or raw_stats['record_count'] == 0:
+        log('No data collected — exiting.')
+        sys.exit(1)
 
     record_count = raw_stats['record_count']
     elapsed      = raw_stats['elapsed_seconds']
