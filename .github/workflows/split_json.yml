@@ -1,0 +1,48 @@
+name: Split users_data.json into 1 GB parts
+
+on:
+  workflow_dispatch:
+
+jobs:
+  split:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360        # 6 h — read ~10 MB/s + upload each part
+
+    steps:
+      # ── 1. Checkout ───────────────────────────────────────────────
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ── 2. Python ─────────────────────────────────────────────────
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      # ── 3. rclone ────────────────────────────────────────────────
+      - name: Install rclone
+        run: |
+          curl -fsSL https://rclone.org/install.sh | sudo bash
+          rclone version
+
+      # ── 4. Python + system dependencies ───────────────────────────
+      #     ijson bundles yajl2_c / yajl2_cffi backends.
+      #     libyajl2 is the runtime C library for yajl2_c (fastest).
+      - name: Install dependencies
+        run: |
+          sudo apt-get install -y libyajl2
+          pip install ijson
+
+      # ── 5. rclone config ─────────────────────────────────────────
+      - name: Configure rclone
+        env:
+          RCLONE_CONF: ${{ secrets.RCLONE_CONF }}
+        run: |
+          mkdir -p ~/.config/rclone
+          echo "$RCLONE_CONF" | base64 -d > ~/.config/rclone/rclone.conf
+          echo "✅ rclone config written"
+          rclone listremotes
+
+      # ── 6. Run splitter ───────────────────────────────────────────
+      - name: Split JSON into 1 GB parts
+        run: python3 split_json.py
