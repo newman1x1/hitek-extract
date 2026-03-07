@@ -79,7 +79,10 @@ FINAL_FNAME        = 'users_data.parquet'
 # Parquet tuning
 ROW_GROUP_RECORDS  = 500_000      # ~50-100 MB uncompressed per row group
 PART_RECORDS       = 5_000_000    # Records per part file before upload
-ZSTD_LEVEL         = 19           # Near-maximum compression
+ZSTD_LEVEL         = 19           # Final merged file — near-maximum compression
+PART_ZSTD_LEVEL    = 3            # Temporary part files — fast write, deleted after merge
+                                  # Level 3 is ~8x faster than level 19 on CPU,
+                                  # bringing throughput from ~5 MB/s → ~70 MB/s.
 
 # Dictionary encoding for low-cardinality string columns
 DICT_COLUMNS       = ['name', 'fname', 'circle']
@@ -424,13 +427,13 @@ class ParquetPartWriter:
             str(self._part_path),
             schema=SCHEMA,
             compression='zstd',
-            compression_level=ZSTD_LEVEL,
+            compression_level=PART_ZSTD_LEVEL,  # fast write; parts are temp files
             use_dictionary=DICT_COLUMNS,
-            write_statistics=True,           # min/max stats → predicate pushdown
+            write_statistics=True,
             version='2.6',
-            data_page_size=1024 * 1024,      # 1 MB data pages
+            data_page_size=1024 * 1024,
             write_batch_size=10000,
-            write_page_index=True,           # column offsets → fast range queries
+            write_page_index=True,
         )
         self._records_in_part = 0
         log(f'📂 Opened part_{self.part_num:05d}.parquet')
