@@ -439,62 +439,115 @@ def check_github_token() -> None:
     except Exception as e:
         warn(f'Could not check token: {e}')
 
-    # Dry-run: check if we can GET the dispatches endpoint (it only supports POST)
-    # A 405 Method Not Allowed means auth is fine; a 403 means insufficient permissions
-    url = f'https://api.github.com/repos/{repo}/dispatches'
+    # ── Step 2: Test repository_dispatch with a real POST ────────────────────
+    # The /dispatches endpoint is POST-ONLY.  GitHub returns 404 for GET on
+    # this path when using an Actions GITHUB_TOKEN (not a PAT), because
+    # GitHub intentionally hides the endpoint to prevent information leakage —
+    # a 404 from GET does NOT mean POST will fail.  We must use the actual POST
+    # method to get a conclusive answer.
+    #
+    # We send event_type='diag_dispatch_test': no workflow listens to this
+    # event type so nothing is actually triggered, but the auth is fully tested.
+    # Expected responses:
+    #   204 — success: auto-continuation WILL work
+    #   422 — bad payload (event_type format): auth OK, continuation will work
+    #   403 — forbidden: token lacks write permission → needs "Read and write"
+    #   404 — can't access endpoint → same fix as 403
+    url  = f'https://api.github.com/repos/{repo}/dispatches'
+    data = json.dumps({'event_type': 'diag_dispatch_test'}).encode('utf-8')
     req2 = urllib.request.Request(
         url,
+        data=data,
         headers={
             'Authorization': f'token {token}',
             'Accept':        'application/vnd.github.v3+json',
+            'Content-Type':  'application/json',
         },
-        method='GET',
+        method='POST',
     )
     try:
-        with urllib.request.urlopen(req2, timeout=15) as _:
-            pass
+        with urllib.request.urlopen(req2, timeout=15) as resp:
+            if resp.status in (200, 201, 204):
+                ok(f'repository_dispatch POST: {resp.status} — auto-continuation WILL WORK ✓')
+            else:
+                warn(f'repository_dispatch POST returned unexpected {resp.status}')
     except urllib.error.HTTPError as e:
-        if e.code == 405:
-            ok(f'repository_dispatch endpoint reachable (405 = Method Not Allowed, auth OK)')
+        body = ''
+        try:
+            body = e.read().decode('utf-8', errors='replace')[:300]
+        except Exception:
+            pass
+        if e.code == 422:
+            # Unprocessable = event_type string is unusual but auth is fine
+            ok(f'repository_dispatch POST: 422 (auth OK, nothing triggered) — auto-continuation WILL WORK')
         elif e.code == 403:
             fail(
-                'CRITICAL: 403 Forbidden on /dispatches — GITHUB_TOKEN lacks write permissions.\n'
-                '       Fix: In GitHub repo → Settings → Actions → General → Workflow permissions\n'
+                'CRITICAL: 403 Forbidden on POST /dispatches — GITHUB_TOKEN lacks write permissions.\n'
+                '       Fix: GitHub repo → Settings → Actions → General → Workflow permissions\n'
                 '            Set to "Read and write permissions"'
             )
         elif e.code == 404:
-            fail(f'404 on /dispatches for repo "{repo}" — check GITHUB_REPOSITORY is correct')
+            fail(
+                f'404 on POST /dispatches for repo "{repo}".\n'
+                f'       This means GITHUB_TOKEN cannot use repository_dispatch.\n'
+                f'       Fix: Settings → Actions → General → Workflow permissions\n'
+                f'            Set to "Read and write permissions"\n'
+                f'       Body: {body}'
+            )
         else:
-            warn(f'Dispatches endpoint returned {e.code}: {e.reason}')
+            warn(f'Dispatches POST returned {e.code}: {e.reason} — {body}')
     except Exception as e:
         warn(f'Could not reach dispatches endpoint: {e}')
 
 
-# ── Check 11: rclone stream test ──────────────────────────────────────────────
+# ── Check 11: rclone stream test — sustained speed measurement ───────────────
 
-def check_stream(rclone_cmd: str, file_size: int) -> None:
-    section('11. RCLONE STREAM TEST (first 512 KB)')
+def check_stream(rclone_cmd: str, file_size: int) -> float:
+    """
+    Measure SUSTAINED Drive → GHA download speed.
+    Returns measured speed in bytes/sec (0 if test failed).
+
+    Strategy:
+      • Read up to 20 MB total (30-second timeout).
+      • First 1 MB is discarded as "connection warm-up" (TCP slow-start,
+        TLS handshake, OAuth refresh, Drive API setup).
+      • Speed is calculated only on the remaining bytes to avoid the
+        misleading cold-start dip (e.g. 347 KB/s measured on first 512 KB
+        became 373-hour estimate when actual sustained speed is 10+ MB/s).
+    """
+    section('11. RCLONE STREAM TEST (sustained speed — 20 MB)')
 
     src = f'{RCLONE_REMOTE}:{SOURCE_FOLDER}/{FILE_NAME}'
-    test_bytes = 512 * 1024  # 512 KB
+    WARMUP_BYTES  = 1 * 1024 * 1024   # 1 MB   warm-up (discarded for speed calc)
+    TARGET_BYTES  = 20 * 1024 * 1024  # 20 MB  total read
+    TIMEOUT_SEC   = 45                 # abort if it takes longer than this
 
-    t0 = time.time()
     proc = subprocess.Popen(
-        [rclone_cmd, 'cat', src, '--buffer-size', '1M'],
+        [rclone_cmd, 'cat', src, '--buffer-size', '4M'],
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
     )
 
-    data = b''
+    data        = bytearray()
+    warmup_done = False
+    t_warmup_end: float = 0.0
+    t_start     = time.time()
+    error_msg   = ''
+
     try:
-        # Read exactly test_bytes
-        while len(data) < test_bytes:
-            chunk = proc.stdout.read(min(4096, test_bytes - len(data)))
+        while len(data) < TARGET_BYTES:
+            if time.time() - t_start > TIMEOUT_SEC:
+                error_msg = f'timeout after {TIMEOUT_SEC}s'
+                break
+            chunk = proc.stdout.read(65536)
             if not chunk:
                 break
             data += chunk
+            if not warmup_done and len(data) >= WARMUP_BYTES:
+                warmup_done = True
+                t_warmup_end = time.time()
     except Exception as e:
-        fail(f'Stream read error: {e}')
+        error_msg = str(e)
     finally:
         proc.terminate()
         try:
@@ -502,61 +555,212 @@ def check_stream(rclone_cmd: str, file_size: int) -> None:
         except Exception:
             proc.kill()
 
-    elapsed = time.time() - t0
-    if len(data) >= 1024:
-        speed = len(data) / elapsed if elapsed > 0 else 0
-        ok(f'Stream test OK: read {fmt_bytes(len(data))} in {elapsed:.1f}s '
-           f'({fmt_bytes(speed)}/s)')
+    total_elapsed  = time.time() - t_start
+    total_bytes    = len(data)
+    cold_speed     = total_bytes / total_elapsed if total_elapsed > 0 else 0
 
-        # Peek at first few bytes
-        preview = data[:200].decode('utf-8', errors='replace').strip()
-        info(f'First 200 chars: {preview!r}')
+    if total_bytes < 1024:
+        fail(f'No data received from stream ({error_msg}) — rclone cat failed')
+        return 0.0
 
-        # Estimate total time
-        if file_size and speed > 0:
-            total_seconds = file_size / speed
-            hours = total_seconds / 3600
-            runs_needed = hours / 5.4167  # 5h 25m per run
-            info(f'Estimated download speed: {fmt_bytes(speed)}/s')
-            info(f'Estimated total stream time: {hours:.1f}h')
-            info(f'Estimated runs needed (~5h25m each): {runs_needed:.1f}')
-            if hours > 6:
-                ok(f'File too large for one run — auto-continuation is REQUIRED (expected)')
-            else:
-                ok(f'File may fit in a single run')
-    else:
-        if len(data) > 0:
-            warn(f'Only read {len(data)} bytes — stream may be slow or rate-limited')
+    # Show cold-start speed (total including warmup) for reference
+    info(f'Total read      : {fmt_bytes(total_bytes)} in {total_elapsed:.1f}s')
+    info(f'Cold-start speed: {fmt_bytes(cold_speed)}/s  '
+         f'(includes ~{WARMUP_BYTES//1024}KB TCP/TLS/OAuth setup — unreliable)')
+
+    # First 200 chars of real data for schema preview
+    preview = bytes(data[:200]).decode('utf-8', errors='replace').strip()
+    info(f'First 200 chars : {preview!r}')
+
+    # Sustained speed: bytes AFTER warm-up
+    if warmup_done and t_warmup_end > 0:
+        sustained_bytes   = total_bytes - WARMUP_BYTES
+        sustained_elapsed = total_elapsed - (t_warmup_end - t_start)
+        if sustained_elapsed > 0.1 and sustained_bytes > 0:
+            sustained_speed = sustained_bytes / sustained_elapsed
+            ok(f'Sustained speed : {fmt_bytes(sustained_speed)}/s  '
+               f'({fmt_bytes(sustained_bytes)} after warm-up in {sustained_elapsed:.1f}s)')
+
+            if file_size and sustained_speed > 0:
+                total_seconds = file_size / sustained_speed
+                hours         = total_seconds / 3600
+                runs_needed   = hours / 5.4167
+                info(f'Projected stream time  : ~{hours:.1f}h at {fmt_bytes(sustained_speed)}/s')
+                info(f'Projected runs needed  : ~{runs_needed:.1f} (5h 25m each)')
+                if hours > 6:
+                    ok(f'File too large for one run — auto-continuation REQUIRED (expected)')
+                else:
+                    ok(f'File may fit in a single run')
+            return sustained_speed
         else:
-            fail(f'No data received from stream — rclone cat failed')
+            warn('Not enough post-warm-up data to measure sustained speed')
+    else:
+        # Didn't reach 1 MB — just report what we have
+        ok(f'Partial stream test: {fmt_bytes(total_bytes)} read ({cold_speed:.0f} B/s — cold start only)')
+
+    return cold_speed
 
 
 # ── Check 12: Estimate conversion jobs ────────────────────────────────────────
 
-def check_estimates(file_size: int) -> None:
+def check_estimates(file_size: int, measured_speed_bps: float = 0) -> None:
     section('12. CONVERSION ESTIMATES')
 
     if not file_size:
         warn('File size unknown — cannot estimate')
         return
 
-    # Assumptions
-    stream_speed_mbps  = 10   # ~10 MB/s typical for Drive on GHA runner
+    # Use measured speed if available, otherwise fall back to 10 MB/s assumption
+    if measured_speed_bps > 0:
+        stream_speed     = measured_speed_bps
+        speed_source     = f'measured: {fmt_bytes(stream_speed)}/s'
+    else:
+        stream_speed     = 10 * 1024 * 1024   # 10 MB/s fallback
+        speed_source     = '10 MB/s assumed (run stream test to measure actual)'
+
     record_size_bytes  = 250  # ~250 bytes per JSON record (typical)
     compress_ratio     = 10   # ZSTD level 19 typical compression ratio
 
-    total_seconds_stream = file_size / (stream_speed_mbps * 1024**2)
+    total_seconds_stream = file_size / stream_speed if stream_speed > 0 else 0
     total_records        = file_size // record_size_bytes
     estimated_output_gb  = (file_size / compress_ratio) / 1024**3
     runs_needed          = total_seconds_stream / (5.4167 * 3600)  # 5h 25m per run
 
     info(f'Source file        : {fmt_bytes(file_size)}')
+    info(f'Stream speed used  : {speed_source}')
     info(f'Est. records       : ~{total_records:,} (at ~{record_size_bytes}B/record)')
     info(f'Est. output size   : ~{estimated_output_gb:.1f} GB (at {compress_ratio}x compression)')
-    info(f'Est. stream time   : ~{total_seconds_stream/3600:.1f}h at {stream_speed_mbps} MB/s')
+    info(f'Est. stream time   : ~{total_seconds_stream/3600:.1f}h')
     info(f'Est. runs needed   : ~{runs_needed:.1f} (5h 25m per run)')
     info(f'Part files expected: ~{total_records // 5_000_000 + 1} (at 5M records/part)')
-    ok('Estimates generated (actual speed may vary)')
+    ok('Estimates generated')
+
+
+# ── Check 13: JSON schema validation ─────────────────────────────────────────
+
+def check_json_schema(rclone_cmd: str) -> None:
+    """
+    Stream the first 5,000 records from the source file, parse them as JSON,
+    and validate the field distribution against the expected Parquet schema.
+
+    This catches schema mismatches BEFORE running a 69-hour conversion and
+    ensures that the extraction logic (extract_record) will work correctly.
+    """
+    section('13. JSON SCHEMA VALIDATION (first 5,000 records)')
+
+    src        = f'{RCLONE_REMOTE}:{SOURCE_FOLDER}/{FILE_NAME}'
+    MAX_RECS   = 5_000
+    READ_LIMIT = 5 * 1024 * 1024   # stop reading after 5 MB regardless
+
+    EXPECTED_FIELDS = {'_id', 'name', 'fname', 'mobile', 'alt', 'email',
+                       'id', 'address', 'circle'}
+
+    proc = subprocess.Popen(
+        [rclone_cmd, 'cat', src, '--buffer-size', '4M'],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+
+    field_counts: dict[str, int] = {}
+    id_formats:   dict[str, int] = {}   # oid format distribution
+    parse_errors  = 0
+    records_ok    = 0
+    extra_fields: set[str] = set()
+    bytes_read    = 0
+
+    try:
+        buf = io.BufferedReader(proc.stdout, buffer_size=2 * 1024 * 1024)
+        for raw_line in buf:
+            bytes_read += len(raw_line)
+            if bytes_read > READ_LIMIT or records_ok >= MAX_RECS:
+                break
+
+            stripped = raw_line.strip()
+            if not stripped or stripped in (b'[', b']'):
+                continue
+            if stripped.endswith(b','):
+                stripped = stripped[:-1]
+            if not stripped.startswith(b'{'):
+                continue
+
+            try:
+                doc = json.loads(stripped)
+            except json.JSONDecodeError:
+                parse_errors += 1
+                continue
+
+            if not isinstance(doc, dict):
+                continue
+
+            records_ok += 1
+            for k in doc:
+                field_counts[k] = field_counts.get(k, 0) + 1
+
+            # _id format
+            _id = doc.get('_id')
+            if _id is None:
+                id_formats['null'] = id_formats.get('null', 0) + 1
+            elif isinstance(_id, dict) and '$oid' in _id:
+                id_formats['extended_json_{$oid}'] = id_formats.get('extended_json_{$oid}', 0) + 1
+            elif isinstance(_id, str):
+                if len(_id) == 24:
+                    id_formats['plain_hex_string'] = id_formats.get('plain_hex_string', 0) + 1
+                else:
+                    id_formats['other_string'] = id_formats.get('other_string', 0) + 1
+            else:
+                id_formats[f'type:{type(_id).__name__}'] = id_formats.get(f'type:{type(_id).__name__}', 0) + 1
+
+            # collect unknown fields
+            for k in doc:
+                if k not in EXPECTED_FIELDS:
+                    extra_fields.add(k)
+
+    except Exception as e:
+        warn(f'Schema validation error: {e}')
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=10)
+        except Exception:
+            proc.kill()
+
+    if records_ok == 0:
+        fail('Could not parse any JSON records for schema validation')
+        return
+
+    info(f'Records parsed      : {records_ok:,} ({parse_errors} parse errors)')
+    info(f'Data read           : {fmt_bytes(bytes_read)}')
+
+    # Field coverage
+    info(f'')
+    info(f'Field coverage against expected schema:')
+    all_good = True
+    for field in sorted(EXPECTED_FIELDS):
+        count    = field_counts.get(field, 0)
+        coverage = count / records_ok * 100
+        marker   = '✅' if coverage >= 50 else ('⚠️ ' if coverage > 0 else '❌')
+        info(f'  {marker}  {field:<12} {count:>6,} / {records_ok:,}  ({coverage:.1f}%)')
+        if coverage == 0 and field not in ('_id',):   # _id may map to oid column
+            warn(f'Field "{field}" is 0% — it will always be NULL in the Parquet output')
+            all_good = False
+
+    # Unknown fields (will go to _extra column)
+    if extra_fields:
+        info(f'')
+        info(f'Unknown fields → captured in _extra column: {sorted(extra_fields)}')
+    else:
+        info(f'No unknown fields — _extra column will always be NULL (clean data)')
+
+    # _id format distribution
+    info(f'')
+    info(f'_id format distribution:')
+    for fmt, cnt in sorted(id_formats.items(), key=lambda x: -x[1]):
+        info(f'  {fmt}: {cnt:,} ({cnt/records_ok*100:.1f}%)')
+
+    if all_good:
+        ok(f'Schema validation passed for {records_ok:,} records')
+    else:
+        ok(f'Schema validated ({records_ok:,} records) — review warnings above')
 
 
 # ── Summary ───────────────────────────────────────────────────────────────────
@@ -608,8 +812,9 @@ def main() -> None:
         check_dest_folder(rclone_cmd)
         check_checkpoint(rclone_cmd)
         check_parts(rclone_cmd)
-        check_stream(rclone_cmd, file_size)
-        check_estimates(file_size)
+        measured_speed = check_stream(rclone_cmd, file_size)
+        check_estimates(file_size, measured_speed)
+        check_json_schema(rclone_cmd)
     else:
         warn('rclone not available — skipping all Drive checks')
         file_size = 0
