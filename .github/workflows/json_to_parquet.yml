@@ -1,44 +1,60 @@
-name: JSON → Parquet (streaming, resumable)
+name: JSON → Parquet (streaming, resumable, auto-continue)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # What this workflow does
 # ─────────────────────────────────────────────────────────────────────────────
-# Converts Gdrive:users_data_extracted/users_data.json (446 GB) to a series
-# of compressed Parquet files in Gdrive:users_data_parquet/.
+# Converts Gdrive:users_data_extracted/users_data.json (446 GB) to a single
+# highly compressed Parquet file: Gdrive:users_data_parquet/users_data.parquet
 #
-# The conversion is RESUMABLE:
-#   • After each output part is uploaded, a checkpoint is saved to Drive.
-#   • Re-triggering the workflow picks up exactly where the previous run ended.
-#   • No data is re-read or duplicated between runs.
+# KEY FEATURES:
+#   • RESUMABLE: Exact byte-offset resume across multiple 6-hour runs
+#   • AUTO-CONTINUE: Automatically triggers next run until complete
+#   • SINGLE OUTPUT: All parts merged into one file at the end
+#   • ZERO DATA LOSS: _extra column captures any unknown/new fields
+#   • OPTIMIZED: ZSTD level 19 compression, dictionary encoding, statistics
 #
-# At ~10 MB/s Drive throughput, the full conversion takes ~3 × 6-hour runs.
-# Just re-trigger this workflow until the script prints "Conversion COMPLETE".
+# USAGE:
+#   1. Trigger the workflow ONCE (manually or via repository_dispatch)
+#   2. Workflow auto-continues until entire file is converted
+#   3. Final output: users_data.parquet (single merged file)
 #
-# Force a restart from scratch:
-#   Trigger the workflow with force_restart = true.
-#   This ignores the existing checkpoint and overwrites all output parts.
+# Force restart from scratch:
+#   Trigger workflow with force_restart = true
+#   This ignores checkpoint and re-converts from byte 0
 #
-# Required secret:
-#   RCLONE_CONF — base64-encoded content of your rclone.conf
-#   (generate with:  base64 -w0 ~/.config/rclone/rclone.conf)
+# Required secrets:
+#   RCLONE_CONF — base64-encoded rclone config
+#                 (generate: base64 -w0 ~/.config/rclone/rclone.conf)
 # ─────────────────────────────────────────────────────────────────────────────
 
 on:
+  # Manual trigger with options
   workflow_dispatch:
     inputs:
       force_restart:
-        description: 'Start from scratch — ignore existing checkpoint and re-convert'
+        description: 'Start from scratch — ignore checkpoint and re-convert'
         required: false
         default: 'false'
         type: choice
         options:
           - 'false'
           - 'true'
+  
+  # Auto-trigger from previous run
+  repository_dispatch:
+    types: [continue_conversion]
+
+# Prevent concurrent runs
+concurrency:
+  group: json-to-parquet
+  cancel-in-progress: false
 
 jobs:
   convert:
     runs-on: ubuntu-latest
-    timeout-minutes: 360      # 6-hour hard cap per run; re-trigger to continue
+    timeout-minutes: 360      # 6-hour hard cap; script stops at 5h 25m
+    permissions:
+      contents: write         # required for repository_dispatch auto-trigger
 
     steps:
       # ── 1. Checkout ───────────────────────────────────────────────────────
@@ -52,26 +68,23 @@ jobs:
           python-version: '3.12'
 
       # ── 3. Cache pip packages ─────────────────────────────────────────────
-      #     pyarrow is ~100 MB; caching saves ~1-2 min on each re-run.
       - name: Cache pip
         uses: actions/cache@v4
         with:
           path: ~/.cache/pip
-          key: ${{ runner.os }}-pip-pyarrow-14
+          key: ${{ runner.os }}-pip-pyarrow-v2
 
       # ── 4. Python dependencies ────────────────────────────────────────────
-      #     Only pyarrow is needed.  It bundles zstd internally — no separate
-      #     zstandard or libyajl2 package required.
       - name: Install Python packages
         run: pip install "pyarrow>=14.0"
 
-      # ── 5. rclone (no FUSE — we use rclone cat) ───────────────────────────
+      # ── 5. rclone ─────────────────────────────────────────────────────────
       - name: Install rclone
         run: |
           curl -fsSL https://rclone.org/install.sh | sudo bash
           rclone version
 
-      # ── 6. rclone config from repository secret ───────────────────────────
+      # ── 6. rclone config ──────────────────────────────────────────────────
       - name: Configure rclone
         env:
           RCLONE_CONF: ${{ secrets.RCLONE_CONF }}
@@ -81,20 +94,22 @@ jobs:
           echo "✅ rclone config written"
           rclone listremotes
 
-      # ── 7. Run the converter ─────────────────────────────────────────────
+      # ── 7. Run converter ──────────────────────────────────────────────────
       - name: Convert JSON → Parquet
         env:
-          FORCE_RESTART: ${{ github.event.inputs.force_restart }}
+          FORCE_RESTART: ${{ github.event.inputs.force_restart || 'false' }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
         run: python3 json_to_parquet.py
 
-      # ── 8. Upload run log as a downloadable artifact ─────────────────────
-      #     if: always() ensures the log is captured even on timeout / error.
-      - name: Upload run summary
+      # ── 8. Upload checkpoint as artifact ──────────────────────────────────
+      - name: Upload run artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: parquet-run-log-${{ github.run_number }}
+          name: parquet-run-${{ github.run_number }}-${{ github.run_attempt }}
           path: |
             convert_checkpoint.json
-          retention-days: 30
+            *.log
+          retention-days: 7
           if-no-files-found: ignore
