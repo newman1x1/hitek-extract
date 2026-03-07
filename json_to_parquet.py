@@ -107,6 +107,13 @@ LOG_INTERVAL       = 15                 # Log progress every 15 seconds
 UPLOAD_TIMEOUT     = 3600               # 60 min max per upload (large parts)
 UPLOAD_RETRIES     = 10
 
+# Force a part close+upload+checkpoint every N seconds even if PART_RECORDS
+# hasn't been reached yet.  This caps data loss to at most one interval worth
+# of work if the runner is hard-killed (SIGKILL) before the normal checkpoint.
+# 300 s = 5 minutes is a good default — small enough to survive early
+# cancellations, large enough to avoid excessive upload churn.
+CHECKPOINT_INTERVAL = 300               # 5 min forced checkpoint
+
 # Time management - Stop WELL before GHA's 6h hard kill
 # GHA sends SIGKILL at 6h which cannot be caught
 # We stop at 5h 25m to ensure final flush + upload + checkpoint
@@ -445,6 +452,26 @@ class ParquetPartWriter:
         if self._batch:
             self._flush_row_group()
         if self._writer is not None and self._records_in_part > 0:
+            self._close_part()
+
+    def force_checkpoint(self) -> None:
+        """
+        Time-triggered checkpoint: flush the in-memory batch, close the
+        current part, upload it, and save the checkpoint — regardless of
+        whether PART_RECORDS has been reached.
+
+        Only acts when at least one full row group (ROW_GROUP_RECORDS rows)
+        has been accumulated, so we never upload a near-empty, wasteful
+        part file.  If the current accumulation is below that threshold the
+        call is a silent no-op.
+        """
+        # Flush the batch first so _records_in_part is up-to-date
+        if self._batch:
+            self._flush_row_group()
+        # Only upload if we have at least one full row group worth of data
+        if self._writer is not None and self._records_in_part >= ROW_GROUP_RECORDS:
+            log(f'⏱️  Timed checkpoint — closing part_{self.part_num:05d} early '
+                f'({fmt_num(self._records_in_part)} rows)')
             self._close_part()
 
     def _open_part(self) -> None:
@@ -796,6 +823,7 @@ def run_conversion(rclone_cmd: str, force_restart: bool) -> str:
     total_lines = 0
     parse_errors = 0
     last_log_time = time.time()
+    last_checkpoint_time = time.time()   # tracks timed part-splits
     first_record_ok = False
     conversion_complete = False
 
@@ -818,6 +846,13 @@ def run_conversion(rclone_cmd: str, force_restart: bool) -> str:
                     f'{fmt_bytes(speed)}/s | ETA {fmt_dur(eta)} | '
                     f'Time left: {fmt_dur(time_remaining())}')
                 last_log_time = now
+
+            # Time-based forced checkpoint — ensures a checkpoint is saved
+            # roughly every CHECKPOINT_INTERVAL seconds even if PART_RECORDS
+            # has not been reached (guards against unexpected early cancellation).
+            if now - last_checkpoint_time >= CHECKPOINT_INTERVAL:
+                writer.force_checkpoint()
+                last_checkpoint_time = now
 
             # Check if we should stop
             if should_stop():
