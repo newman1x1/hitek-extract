@@ -96,6 +96,7 @@ jobs:
 
       # ── 7. Run converter ──────────────────────────────────────────────────
       - name: Convert JSON → Parquet
+        id: convert
         env:
           FORCE_RESTART: ${{ github.event.inputs.force_restart || 'false' }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -113,3 +114,31 @@ jobs:
             *.log
           retention-days: 7
           if-no-files-found: ignore
+
+      # ── 9. Safety-net continuation ────────────────────────────────────────
+      # Triggers the next run if the convert step was hard-killed (SIGKILL)
+      # before Python's own trigger_next_run() could fire.
+      # When the convert step exits cleanly (outcome == success) Python has
+      # already handled continuation, so this step is a fast no-op.
+      - name: Ensure auto-continuation on hard kill
+        if: always()
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if [ "${{ steps.convert.outcome }}" = "success" ]; then
+            echo "✅ Convert step succeeded — Python handled continuation"
+            exit 0
+          fi
+          echo "⚠️  Convert step outcome: '${{ steps.convert.outcome }}' — checking for checkpoint..."
+          if rclone lsf "Gdrive:users_data_parquet/convert_checkpoint.json" 2>/dev/null \
+               | grep -q "convert_checkpoint.json"; then
+            echo "📌 Checkpoint found on Drive — triggering next run..."
+            curl -sf -X POST \
+              -H "Authorization: token $GITHUB_TOKEN" \
+              -H "Accept: application/vnd.github.v3+json" \
+              "https://api.github.com/repos/${{ github.repository }}/dispatches" \
+              -d '{"event_type":"continue_conversion"}'
+            echo "🚀 Next run triggered"
+          else
+            echo "ℹ️  No checkpoint on Drive — nothing to continue"
+          fi
