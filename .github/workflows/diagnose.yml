@@ -15,7 +15,7 @@ on:
 jobs:
   diagnose:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
     permissions:
       contents: write     # required to test repository_dispatch endpoint
 
@@ -53,6 +53,7 @@ jobs:
       # ── 6. Run diagnostics ──────────────────────────────────────────────────
       - name: Run diagnostics
         env:
+          GH_PAT: ${{ secrets.GH_PAT }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GITHUB_REPOSITORY: ${{ github.repository }}
         run: python3 diagnose.py
