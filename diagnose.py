@@ -509,7 +509,7 @@ def check_github_token() -> None:
 
 # ── Check 11: rclone stream test — sustained speed measurement ───────────────
 
-def check_stream(rclone_cmd: str, file_size: int) -> float:
+def check_stream(rclone_cmd: str, file_size: int) -> tuple[float, bytes]:
     """
     Measure SUSTAINED Drive → GHA download speed.
     Returns measured speed in bytes/sec (0 if test failed).
@@ -568,7 +568,7 @@ def check_stream(rclone_cmd: str, file_size: int) -> float:
 
     if total_bytes < 1024:
         fail(f'No data received from stream ({error_msg}) — rclone cat failed')
-        return 0.0
+        return 0.0, b''
 
     # Show cold-start speed (total including warmup) for reference
     info(f'Total read      : {fmt_bytes(total_bytes)} in {total_elapsed:.1f}s')
@@ -598,14 +598,14 @@ def check_stream(rclone_cmd: str, file_size: int) -> float:
                     ok(f'File too large for one run — auto-continuation REQUIRED (expected)')
                 else:
                     ok(f'File may fit in a single run')
-            return sustained_speed
+            return sustained_speed, bytes(data)
         else:
             warn('Not enough post-warm-up data to measure sustained speed')
     else:
         # Didn't reach 1 MB — just report what we have
         ok(f'Partial stream test: {fmt_bytes(total_bytes)} read ({cold_speed:.0f} B/s — cold start only)')
 
-    return cold_speed
+    return cold_speed, bytes(data)
 
 
 # ── Check 12: Estimate conversion jobs ────────────────────────────────────────
@@ -645,64 +645,36 @@ def check_estimates(file_size: int, measured_speed_bps: float = 0) -> None:
 
 # ── Check 13: JSON schema validation ─────────────────────────────────────────
 
-def check_json_schema(rclone_cmd: str) -> None:
+def check_json_schema(sample_bytes: bytes) -> None:
     """
-    Stream the first 5,000 records from the source file, parse them as JSON,
-    and validate the field distribution against the expected Parquet schema.
+    Parse the first 5,000 records from the bytes already captured by
+    check_stream (check 11) and validate the field distribution against
+    the expected Parquet schema.
 
-    This catches schema mismatches BEFORE running a 69-hour conversion and
-    ensures that the extraction logic (extract_record) will work correctly.
+    No new rclone connection is opened here — reusing the 20 MB already
+    downloaded avoids Drive rate-limiting a third connection and eliminates
+    the hang that killed the runner in the previous diagnostic run.
     """
     section('13. JSON SCHEMA VALIDATION (first 5,000 records)')
 
-    src        = f'{RCLONE_REMOTE}:{SOURCE_FOLDER}/{FILE_NAME}'
-    MAX_RECS   = 5_000
-    READ_LIMIT = 5 * 1024 * 1024   # stop reading after 5 MB regardless
-
+    MAX_RECS = 5_000
     EXPECTED_FIELDS = {'_id', 'name', 'fname', 'mobile', 'alt', 'email',
                        'id', 'address', 'circle'}
 
-    proc = subprocess.Popen(
-        [rclone_cmd, 'cat', src, '--buffer-size', '4M'],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-    )
+    if not sample_bytes:
+        fail('No sample bytes available for schema validation (check_stream failed)')
+        return
+
+    info(f'Using {fmt_bytes(len(sample_bytes))} captured by stream test — no new rclone connection')
+
+    raw_buf    = sample_bytes
+    bytes_read = len(raw_buf)
 
     field_counts: dict[str, int] = {}
     id_formats:   dict[str, int] = {}   # oid format distribution
     parse_errors  = 0
     records_ok    = 0
     extra_fields: set[str] = set()
-    bytes_read    = 0
-
-    # ── Read raw chunks with hard timeout — avoids the hang that killed check 13
-    # Do NOT use io.BufferedReader + for-line-in-buf here: that blocks waiting
-    # for data indefinitely when rclone takes time to reconnect to Drive after
-    # the previous stream test.  We read raw chunks with a wall-clock timeout
-    # then split lines from the in-memory buffer.
-    TIMEOUT_SEC = 90
-    t_read_start = time.time()
-    raw_buf = bytearray()
-
-    try:
-        while len(raw_buf) < READ_LIMIT:
-            if time.time() - t_read_start > TIMEOUT_SEC:
-                info(f'Read timeout after {TIMEOUT_SEC}s — processing {fmt_bytes(len(raw_buf))} collected so far')
-                break
-            chunk = proc.stdout.read(65536)
-            if not chunk:
-                break
-            raw_buf += chunk
-    except Exception as e:
-        warn(f'Schema read error: {e}')
-    finally:
-        proc.terminate()
-        try:
-            proc.wait(timeout=10)
-        except Exception:
-            proc.kill()
-
-    bytes_read = len(raw_buf)
 
     # ── Process lines from the in-memory buffer ──────────────────────────────
     for raw_line in raw_buf.split(b'\n'):
@@ -714,6 +686,11 @@ def check_json_schema(rclone_cmd: str) -> None:
             continue
         if stripped.endswith(b','):
             stripped = stripped[:-1]
+        # Handle first line "[{..." and last line "...}]"
+        if stripped.startswith(b'[{'):
+            stripped = stripped[1:]   # strip leading '['
+        if stripped.endswith(b'}]'):
+            stripped = stripped[:-1]  # strip trailing ']'
         if not stripped.startswith(b'{'):
             continue
 
@@ -837,9 +814,9 @@ def main() -> None:
         check_dest_folder(rclone_cmd)
         check_checkpoint(rclone_cmd)
         check_parts(rclone_cmd)
-        measured_speed = check_stream(rclone_cmd, file_size)
+        measured_speed, sample_bytes = check_stream(rclone_cmd, file_size)
         check_estimates(file_size, measured_speed)
-        check_json_schema(rclone_cmd)
+        check_json_schema(sample_bytes)
     else:
         warn('rclone not available — skipping all Drive checks')
         file_size = 0
