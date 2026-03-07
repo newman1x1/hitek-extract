@@ -1,4 +1,4 @@
-name: JSON → Parquet (streaming, resumable, auto-continue)
+name: JSON → Parquet v2 (streaming, resumable, auto-continue)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # What this workflow does
@@ -6,12 +6,23 @@ name: JSON → Parquet (streaming, resumable, auto-continue)
 # Converts Gdrive:users_data_extracted/users_data.json (446 GB) to a single
 # highly compressed Parquet file: Gdrive:users_data_parquet/users_data.parquet
 #
-# KEY FEATURES:
+# KEY FEATURES (V2):
 #   • RESUMABLE: Exact byte-offset resume across multiple 6-hour runs
 #   • AUTO-CONTINUE: Automatically triggers next run until complete
 #   • SINGLE OUTPUT: All parts merged into one file at the end
 #   • ZERO DATA LOSS: _extra column captures any unknown/new fields
-#   • OPTIMIZED: ZSTD level 19 compression, dictionary encoding, statistics
+#   • OPTIMIZED: ZSTD level 19 compression, dictionary encoding, bloom filters
+#
+# V2 FIXES over original:
+#   1. STARTUP CHECKPOINT: Written immediately before streaming begins, so the
+#      safety-net step always has a checkpoint even if killed in first 5 min.
+#   2. MERGE BUG FIX: finally block no longer deletes the final merged file
+#      after a successful upload.
+#   3. HEARTBEAT: Prints status every 30 s — including BEFORE first byte
+#      arrives (pre-stream thread) so GitHub never thinks the job is stalled.
+#   4. BLOOM FILTERS on mobile, email, name — fast O(1) lookups on Parquet.
+#   5. PERMISSIONS: This workflow requires "Read and write permissions" under
+#      Settings → Actions → General → Workflow permissions.
 #
 # USAGE:
 #   1. Trigger the workflow ONCE (manually or via repository_dispatch)
@@ -20,11 +31,14 @@ name: JSON → Parquet (streaming, resumable, auto-continue)
 #
 # Force restart from scratch:
 #   Trigger workflow with force_restart = true
-#   This ignores checkpoint and re-converts from byte 0
 #
 # Required secrets:
 #   RCLONE_CONF — base64-encoded rclone config
 #                 (generate: base64 -w0 ~/.config/rclone/rclone.conf)
+#
+# Required repository settings:
+#   Settings → Actions → General → Workflow permissions
+#   → "Read and write permissions"  ← REQUIRED for auto-continuation
 # ─────────────────────────────────────────────────────────────────────────────
 
 on:
@@ -99,9 +113,14 @@ jobs:
         id: convert
         env:
           FORCE_RESTART: ${{ github.event.inputs.force_restart || 'false' }}
+          # GH_PAT: classic Personal Access Token with 'repo' scope.
+          # Store it as a repo secret named GH_PAT for reliable auto-continuation.
+          # If GH_PAT is not set the script falls back to GITHUB_TOKEN, which
+          # requires "Read and write permissions" in Settings → Actions → General.
+          GH_PAT: ${{ secrets.GH_PAT }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GITHUB_REPOSITORY: ${{ github.repository }}
-        run: python3 json_to_parquet.py
+        run: python3 V2_json_to_parquet.py
 
       # ── 8. Upload checkpoint as artifact ──────────────────────────────────
       - name: Upload run artifacts
@@ -123,6 +142,7 @@ jobs:
       - name: Ensure auto-continuation on hard kill
         if: always()
         env:
+          GH_PAT: ${{ secrets.GH_PAT }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           if [ "${{ steps.convert.outcome }}" = "success" ]; then
@@ -130,15 +150,19 @@ jobs:
             exit 0
           fi
           echo "⚠️  Convert step outcome: '${{ steps.convert.outcome }}' — checking for checkpoint..."
+          # Prefer GH_PAT over GITHUB_TOKEN for reliable dispatch
+          DISPATCH_TOKEN="${GH_PAT:-$GITHUB_TOKEN}"
+          TOKEN_TYPE=$( [ -n "$GH_PAT" ] && echo "GH_PAT" || echo "GITHUB_TOKEN" )
+          echo "Using token type: $TOKEN_TYPE"
           if rclone lsf "Gdrive:users_data_parquet/convert_checkpoint.json" 2>/dev/null \
                | grep -q "convert_checkpoint.json"; then
             echo "📌 Checkpoint found on Drive — triggering next run..."
             curl -sf -X POST \
-              -H "Authorization: token $GITHUB_TOKEN" \
+              -H "Authorization: token $DISPATCH_TOKEN" \
               -H "Accept: application/vnd.github.v3+json" \
               "https://api.github.com/repos/${{ github.repository }}/dispatches" \
               -d '{"event_type":"continue_conversion"}'
-            echo "🚀 Next run triggered"
+            echo "🚀 Next run triggered via $TOKEN_TYPE"
           else
             echo "ℹ️  No checkpoint on Drive — nothing to continue"
           fi
