@@ -431,10 +431,6 @@ class ParquetPartWriter:
             data_page_size=1024 * 1024,      # 1 MB data pages
             write_batch_size=10000,
             write_page_index=True,           # column offsets → fast range queries
-            write_bloom_filter=True,         # O(1) point-lookups on ALL columns
-                                             # (mobile, email, name, id etc.)
-                                             # Bug-fix: previously built the bloom
-                                             # filter dict but never passed it here.
         )
         self._records_in_part = 0
         log(f'📂 Opened part_{self.part_num:05d}.parquet')
