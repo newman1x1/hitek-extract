@@ -113,8 +113,22 @@ DEST_FOLDER        = 'users_data_parquet'      # Drive folder for Parquet output
 CHECKPOINT_FNAME   = 'convert_checkpoint.json' # stored inside DEST_FOLDER
 
 # Parquet tuning
-ROW_GROUP_RECORDS  = 500_000    # records per row group (smaller = better predicate pushdown)
-PART_RECORDS       = 10_000_000 # records per output .parquet file (≈ 200–400 MB compressed)
+#
+# WHY THESE VALUES:
+#   At ~10 MB/s Drive read speed and ~247 bytes/record:
+#     1 M records = ~247 MB to read  ≈ 25 sec
+#     + write/compress ~30-50 MB Parquet  ≈ 3 sec
+#     + upload to Drive  ≈ 3-5 sec
+#     → checkpoint saved every ~35 seconds
+#
+#   With PART_RECORDS = 10_000_000 the first checkpoint happened at
+#   ~4 min 50 sec — right at the edge of abrupt runner shutdowns.
+#   "Cleaning up orphan processes" = SIGKILL (not SIGTERM), so the
+#   finally block never fires and ALL progress is lost.
+#   At 1 M records, even a 5-minute run saves ~8 checkpoints.
+#
+ROW_GROUP_RECORDS  = 100_000    # records per row group (5 groups per part file)
+PART_RECORDS       = 1_000_000  # records per output .parquet file (≈ 25–50 MB compressed)
 ZSTD_LEVEL         = 15         # zstd compression level (1–22); 15 = best quality vs speed
 
 # Dictionary-encode columns with repeated values to maximise compression.
@@ -128,6 +142,13 @@ BUFFER_SIZE        = 8 * 1024 * 1024   # 8 MB read-ahead buffer for line iterati
 LOG_INTERVAL       = 60                 # seconds between progress log lines
 UPLOAD_TIMEOUT     = 1800               # 30 min max per rclone upload
 UPLOAD_RETRIES     = 5
+
+# Self-imposed run time limit.
+# GHA hard-kills the runner at 6h (SIGKILL — cannot be caught).
+# We stop ourselves at 5h 30m so the current part is flushed,
+# uploaded, and the checkpoint is saved cleanly before GHA fires.
+# Formula: hours * 3600 + minutes * 60
+RUN_LIMIT_SECONDS  = 5 * 3600 + 30 * 60   # 5 h 30 m  (GHA limit = 6 h)
 
 WORK_DIR           = Path(os.path.dirname(os.path.abspath(__file__)))
 
@@ -747,6 +768,14 @@ def run_conversion(rclone_cmd: str, force_restart: bool) -> None:
             rec = extract_record(doc)
             writer.add_record(rec)
             _log_progress()
+            # Self-imposed time limit: stop cleanly before GHA's hard SIGKILL.
+            # The break exits the for-loop normally so the finally block runs,
+            # flush_all() uploads the current partial part, and the checkpoint
+            # is saved.  Next run resumes from exactly this byte offset.
+            if time.time() - start_time >= RUN_LIMIT_SECONDS:
+                log(f'\n⏰  Run limit ({fmt_dur(RUN_LIMIT_SECONDS)}) reached — '
+                    f'stopping cleanly after {fmt_num(writer.total_written)} rows.')
+                break
 
     except (KeyboardInterrupt, SystemExit):
         log(f'\n⚠️  Interrupted after {fmt_num(writer.total_written)} rows — '
