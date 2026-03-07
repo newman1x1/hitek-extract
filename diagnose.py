@@ -676,8 +676,25 @@ def check_json_schema(sample_bytes: bytes) -> None:
     records_ok    = 0
     extra_fields: set[str] = set()
 
-    # ── Process lines from the in-memory buffer ──────────────────────────────
-    for raw_line in raw_buf.split(b'\n'):
+    # ── Format probe — understand what we actually received ──────────────────
+    newline_count = raw_buf.count(b'\n')
+    cr_count      = raw_buf.count(b'\r')
+    info(f'Format probe        : {newline_count:,} \\n  |  {cr_count:,} \\r  in {fmt_bytes(bytes_read)}')
+    # Show first 500 bytes escaped so we can see exact whitespace/separators
+    probe_text = repr(bytes(raw_buf[:500]))[2:-1]  # strip b'...' wrapper
+    info(f'First 500 bytes     : {probe_text}')
+
+    # ── Try newline-delimited parsing first ───────────────────────────────────
+    # Support \n, \r\n, and \r-only line endings
+    if newline_count > 0:
+        lines = raw_buf.replace(b'\r\n', b'\n').replace(b'\r', b'\n').split(b'\n')
+    elif cr_count > 0:
+        lines = raw_buf.split(b'\r')
+    else:
+        lines = [raw_buf]  # no line endings — entire buffer is one "line"
+    info(f'Lines after split   : {len(lines):,}  (first 3 lengths: {[len(l) for l in lines[:3]]})')
+
+    for raw_line in lines:
         if records_ok >= MAX_RECS:
             break
 
@@ -726,8 +743,88 @@ def check_json_schema(sample_bytes: bytes) -> None:
             if k not in EXPECTED_FIELDS:
                 extra_fields.add(k)
 
+    info(f'After newline parse : {records_ok:,} ok, {parse_errors} json errors')
+
+    # ── Fallback: scan for {...} objects using brace depth counter  ──────────
+    # Used when the file has few/no newlines (compact array format).
     if records_ok == 0:
-        fail('Could not parse any JSON records for schema validation')
+        info('Newline split found 0 records — trying brace-scan fallback...')
+        depth   = 0
+        in_str  = False
+        escape  = False
+        obj_start = -1
+        obj_bytes = bytearray()
+        i = 0
+        scan_buf = raw_buf
+        while i < len(scan_buf) and records_ok < MAX_RECS:
+            b = scan_buf[i]
+            ch = bytes([b])
+            if escape:
+                escape = False
+                if obj_start >= 0:
+                    obj_bytes += ch
+                i += 1
+                continue
+            if in_str:
+                if ch == b'\\':
+                    escape = True
+                elif ch == b'"':
+                    in_str = False
+                if obj_start >= 0:
+                    obj_bytes += ch
+                i += 1
+                continue
+            if ch == b'"':
+                in_str = True
+                if obj_start >= 0:
+                    obj_bytes += ch
+                i += 1
+                continue
+            if ch == b'{':
+                if depth == 0:
+                    obj_start = i
+                    obj_bytes = bytearray(ch)
+                elif obj_start >= 0:
+                    obj_bytes += ch
+                depth += 1
+            elif ch == b'}':
+                depth -= 1
+                if obj_start >= 0:
+                    obj_bytes += ch
+                if depth == 0 and obj_start >= 0:
+                    try:
+                        doc = json.loads(obj_bytes)
+                        if isinstance(doc, dict):
+                            records_ok += 1
+                            for k in doc:
+                                field_counts[k] = field_counts.get(k, 0) + 1
+                            _id = doc.get('_id')
+                            if _id is None:
+                                id_formats['null'] = id_formats.get('null', 0) + 1
+                            elif isinstance(_id, dict) and '$oid' in _id:
+                                id_formats['extended_json_{$oid}'] = id_formats.get('extended_json_{$oid}', 0) + 1
+                            elif isinstance(_id, str):
+                                if len(_id) == 24:
+                                    id_formats['plain_hex_string'] = id_formats.get('plain_hex_string', 0) + 1
+                                else:
+                                    id_formats['other_string'] = id_formats.get('other_string', 0) + 1
+                            else:
+                                id_formats[f'type:{type(_id).__name__}'] = id_formats.get(f'type:{type(_id).__name__}', 0) + 1
+                            for k in doc:
+                                if k not in EXPECTED_FIELDS:
+                                    extra_fields.add(k)
+                    except json.JSONDecodeError:
+                        parse_errors += 1
+                    obj_start = -1
+                    obj_bytes = bytearray()
+            elif obj_start >= 0:
+                obj_bytes += ch
+            i += 1
+        info(f'After brace-scan    : {records_ok:,} ok, {parse_errors} json errors')
+
+    if records_ok == 0:
+        fail(f'Could not parse any JSON records for schema validation '
+             f'({parse_errors} parse errors, {newline_count:,} newlines in {fmt_bytes(bytes_read)})')
         return
 
     info(f'Records parsed      : {records_ok:,} ({parse_errors} parse errors)')
