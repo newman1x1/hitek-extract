@@ -734,13 +734,27 @@ def _append_parquet(src: Path, writer: pq.ParquetWriter) -> int:
     """
     pf = pq.ParquetFile(str(src))
     total_rows = 0
-    for i in range(pf.metadata.num_row_groups):
+    num_rgs = pf.metadata.num_row_groups
+    t0 = time.time()
+    last_dot = t0
+    dots = 0
+    for i in range(num_rgs):
         tbl = pf.read_row_group(i, columns=None, use_pandas_metadata=False)
-        # Enforce our canonical schema (handles column-order & type safety)
         tbl = tbl.cast(SCHEMA)
         writer.write_table(tbl)
         total_rows += tbl.num_rows
         del tbl
+        # Lightweight heartbeat: print a dot every 60s to prevent GHA
+        # stall-kill without flooding the log (one dot ≈ one minute).
+        now = time.time()
+        if now - last_dot >= 60:
+            print('.', end='', flush=True)
+            dots += 1
+            last_dot = now
+    if dots:
+        print(flush=True)  # newline after dots
+    elapsed = time.time() - t0
+    log(f'   📝 {num_rgs} row groups | {total_rows:,} rows | {fmt_dur(elapsed)}')
     del pf
     gc.collect()
     src.unlink(missing_ok=True)
@@ -846,7 +860,21 @@ def _merge_phase_l1(rclone_cmd: str, mcp: dict) -> str:
                 # Download part → merge → auto-deleted by _append_parquet
                 if not _rclone_dl(rclone_cmd, part_name, PART_DL):
                     writer.close(); writer = None
-                    for p in (WORK_TMP, PART_DL): p.unlink(missing_ok=True)
+                    PART_DL.unlink(missing_ok=True)
+                    # Try to save accumulated work before giving up
+                    if rows_in_batch > 0 and WORK_TMP.exists():
+                        partial_name = f'merge_l1_{batch_idx + 1:05d}_partial.parquet'
+                        log(f'💾 Saving {rows_in_batch:,} accumulated rows as {partial_name}...')
+                        if _rclone_ul(rclone_cmd, WORK_TMP, partial_name):
+                            mcp.update({
+                                'phase':                      'l1_merging',
+                                'current_batch_index':         batch_idx,
+                                'current_batch_parts_merged':  list(already_done),
+                                'current_partial_name':        partial_name,
+                            })
+                            save_merge_checkpoint(rclone_cmd, mcp)
+                            log('✅ Progress saved — will resume from here next run')
+                    WORK_TMP.unlink(missing_ok=True)
                     log(f'❌ Download of {part_name} failed — will retry next run')
                     return 'continue'
 
@@ -856,14 +884,14 @@ def _merge_phase_l1(rclone_cmd: str, mcp: dict) -> str:
                 log(f'   ✅ {part_name}: {n:,} rows '
                     f'(batch total: {rows_in_batch:,})')
 
-                # Checkpoint after each part — survives SIGKILL between parts
-                mcp.update({
-                    'phase':                      'l1_merging',
-                    'current_batch_index':         batch_idx,
-                    'current_batch_parts_merged':  list(already_done),
-                    'current_partial_name':        None,
-                })
-                save_merge_checkpoint(rclone_cmd, mcp)
+                # NOTE: We intentionally do NOT save a merge checkpoint here.
+                # The accumulated data lives only in WORK_TMP (local disk).
+                # If we recorded already_done in the checkpoint but SIGKILL
+                # destroys WORK_TMP before a partial upload, the next run
+                # would skip those parts — silently losing data.
+                # Safe checkpoints happen only when WORK_TMP is uploaded:
+                #   • time-limit partial upload (above)
+                #   • full batch upload (below)
 
             # ── Full batch done — upload L1 file ──────────────────────────────
             writer.close(); writer = None
@@ -933,6 +961,22 @@ def _merge_phase_l1(rclone_cmd: str, mcp: dict) -> str:
             if writer is not None:
                 try: writer.close()
                 except Exception: pass
+            # Try to save accumulated work before giving up
+            if rows_in_batch > 0 and WORK_TMP.exists():
+                partial_name = f'merge_l1_{batch_idx + 1:05d}_partial.parquet'
+                log(f'💾 Saving {rows_in_batch:,} accumulated rows as {partial_name}...')
+                try:
+                    if _rclone_ul(rclone_cmd, WORK_TMP, partial_name):
+                        mcp.update({
+                            'phase':                      'l1_merging',
+                            'current_batch_index':         batch_idx,
+                            'current_batch_parts_merged':  list(already_done),
+                            'current_partial_name':        partial_name,
+                        })
+                        save_merge_checkpoint(rclone_cmd, mcp)
+                        log('✅ Progress saved')
+                except Exception:
+                    pass
             for p in (WORK_TMP, PART_DL, PARTIAL_DL):
                 p.unlink(missing_ok=True)
             return 'continue'
@@ -1050,7 +1094,20 @@ def _merge_phase_final(rclone_cmd: str, mcp: dict) -> str:
 
             if not _rclone_dl(rclone_cmd, l1_name, L1_DL):
                 writer.close(); writer = None
-                for p in (WORK_TMP, L1_DL): p.unlink(missing_ok=True)
+                L1_DL.unlink(missing_ok=True)
+                # Try to save accumulated work before giving up
+                if rows_total > 0 and WORK_TMP.exists():
+                    partial_name = 'users_data_partial.parquet'
+                    log(f'💾 Saving {rows_total:,} accumulated rows as {partial_name}...')
+                    if _rclone_ul(rclone_cmd, WORK_TMP, partial_name):
+                        mcp.update({
+                            'phase':               'final_merging',
+                            'l1_files_merged':      list(l1_files_merged),
+                            'current_partial_name': partial_name,
+                        })
+                        save_merge_checkpoint(rclone_cmd, mcp)
+                        log('✅ Progress saved — will resume from here next run')
+                WORK_TMP.unlink(missing_ok=True)
                 log(f'❌ Download of {l1_name} failed — will retry next run')
                 return 'continue'
 
@@ -1059,13 +1116,14 @@ def _merge_phase_final(rclone_cmd: str, mcp: dict) -> str:
             l1_files_merged = list(l1_files_merged) + [l1_name]
             log(f'   ✅ {l1_name}: {n:,} rows (total: {rows_total:,})')
 
-            # Checkpoint after every L1 file
-            mcp.update({
-                'phase':               'final_merging',
-                'l1_files_merged':      list(l1_files_merged),
-                'current_partial_name': None,
-            })
-            save_merge_checkpoint(rclone_cmd, mcp)
+            # NOTE: We intentionally do NOT save a merge checkpoint here.
+            # WORK_TMP holds the accumulated data on local disk only.
+            # If we recorded l1_files_merged but SIGKILL destroys WORK_TMP
+            # before a partial upload, the next run would skip those L1
+            # files — silently losing their data from the final output.
+            # Safe checkpoints happen only when WORK_TMP is uploaded:
+            #   • time-limit partial upload (above)
+            #   • final file upload (below)
 
         # ── All L1 files merged — upload the final file ───────────────────────
         writer.close(); writer = None
@@ -1121,6 +1179,21 @@ def _merge_phase_final(rclone_cmd: str, mcp: dict) -> str:
         if writer is not None:
             try: writer.close()
             except Exception: pass
+        # Try to save accumulated work before giving up
+        if rows_total > 0 and WORK_TMP.exists():
+            partial_name = 'users_data_partial.parquet'
+            log(f'💾 Saving {rows_total:,} accumulated rows as {partial_name}...')
+            try:
+                if _rclone_ul(rclone_cmd, WORK_TMP, partial_name):
+                    mcp.update({
+                        'phase':               'final_merging',
+                        'l1_files_merged':      list(l1_files_merged),
+                        'current_partial_name': partial_name,
+                    })
+                    save_merge_checkpoint(rclone_cmd, mcp)
+                    log('✅ Progress saved')
+            except Exception:
+                pass
         for p in (WORK_TMP, L1_DL, PARTIAL_DL):
             p.unlink(missing_ok=True)
         return 'continue'
