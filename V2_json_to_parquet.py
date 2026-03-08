@@ -721,14 +721,30 @@ def _make_final_writer(path: Path) -> pq.ParquetWriter:
 
 
 def _append_parquet(src: Path, writer: pq.ParquetWriter) -> int:
-    """Read src → append all rows to writer. Deletes src. Returns row count."""
-    tbl = pq.read_table(str(src), schema=SCHEMA)
-    writer.write_table(tbl)
-    n = tbl.num_rows
-    del tbl
+    """Read src row-group by row-group → append to writer. Deletes src.
+
+    Streams through the file without loading it entirely into RAM.
+    Peak memory ≈ one row-group (~50-200 MB) instead of the full file
+    (which can be 15+ GB decompressed for L1 files and would OOM on
+    the 7 GB GitHub Actions runner).
+
+    All Parquet properties (ZSTD compression, dictionary encoding,
+    write_statistics, write_page_index) are preserved because the
+    *writer* controls those settings — we just feed it Arrow tables.
+    """
+    pf = pq.ParquetFile(str(src))
+    total_rows = 0
+    for i in range(pf.metadata.num_row_groups):
+        tbl = pf.read_row_group(i, columns=None, use_pandas_metadata=False)
+        # Enforce our canonical schema (handles column-order & type safety)
+        tbl = tbl.cast(SCHEMA)
+        writer.write_table(tbl)
+        total_rows += tbl.num_rows
+        del tbl
+    del pf
     gc.collect()
     src.unlink(missing_ok=True)
-    return n
+    return total_rows
 
 
 # ════════════════════════════════════════════════════════════════════════════════
