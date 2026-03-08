@@ -1,0 +1,71 @@
+name: Transfer Parquet — Google Drive to HuggingFace
+
+on:
+  workflow_dispatch:        # run manually from the Actions tab
+  # Uncomment to also run on a schedule:
+  # schedule:
+  #   - cron: '0 2 * * *'  # every day at 02:00 UTC
+
+jobs:
+  transfer:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360   # 6-hour hard cap (well above the ~50 min needed)
+
+    steps:
+      # ─────────────────────────────────────────────────────────────
+      # 1. Checkout repo (needed so transfer_to_hf.py is available)
+      # ─────────────────────────────────────────────────────────────
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ─────────────────────────────────────────────────────────────
+      # 2. Install Python packages
+      # ─────────────────────────────────────────────────────────────
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install Python dependencies
+        run: pip install --quiet huggingface_hub
+
+      # ─────────────────────────────────────────────────────────────
+      # 3. Install rclone
+      # ─────────────────────────────────────────────────────────────
+      - name: Install rclone
+        run: |
+          curl -fsSL https://rclone.org/install.sh | sudo bash
+          rclone version
+
+      # ─────────────────────────────────────────────────────────────
+      # 4. Write rclone config from secret
+      #    The secret value must be the base64-encoded rclone.conf
+      #    (same secret already used by json_to_parquet.yml)
+      # ─────────────────────────────────────────────────────────────
+      - name: Configure rclone
+        env:
+          RCLONE_CONF: ${{ secrets.RCLONE_CONF }}
+        run: |
+          mkdir -p ~/.config/rclone
+          echo "$RCLONE_CONF" | base64 -d > ~/.config/rclone/rclone.conf
+          echo "rclone configured"
+
+      # ─────────────────────────────────────────────────────────────
+      # 5. Show free disk space before starting
+      # ─────────────────────────────────────────────────────────────
+      - name: Check disk space
+        run: df -h /
+
+      # ─────────────────────────────────────────────────────────────
+      # 6. Run the transfer
+      #    Downloads one file at a time from Drive, uploads to HF,
+      #    deletes locally, then moves to the next.
+      #    Automatically skips files already uploaded (resume-safe).
+      # ─────────────────────────────────────────────────────────────
+      - name: Transfer files
+        env:
+          HF_TOKEN:      ${{ secrets.HF_TOKEN }}
+          HF_REPO:       ${{ secrets.HF_REPO }}
+          GDRIVE_FOLDER: Gdrive:users_data_parquet
+          FILE_PATTERN:  merge_l1_*.parquet
+        run: python3 transfer_to_hf.py
