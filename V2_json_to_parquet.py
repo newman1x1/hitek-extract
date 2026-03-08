@@ -514,141 +514,605 @@ class ParquetPartWriter:
 
 
 # ════════════════════════════════════════════════════════════════════════════════
-# MERGE PARTS INTO SINGLE FILE
+# HIERARCHICAL MERGE  —  2-level, time-aware, fully resumable
 # ════════════════════════════════════════════════════════════════════════════════
-def merge_parts(rclone_cmd: str) -> bool:
-    """
-    Stream-merge all part files from Drive into a single Parquet file.
-    Downloads one part at a time → appends → deletes local copy.
-    Peak disk = (growing merged file) + (1 part ≈ 100 MB).
-    """
-    log('\n🔗 Starting streaming merge...')
+#
+# Strategy
+# ─────────────────────────────────────────────────────────────────────────────
+# Phase 1 (L1): Groups original part_*.parquet files into batches of
+#               L1_BATCH_SIZE (20).  Each batch is merged locally (one part
+#               downloaded at a time → appended → deleted) then uploaded as
+#               merge_l1_XXXXX.parquet.  Source parts are deleted from Drive
+#               immediately after each successful batch upload.
+#
+# Phase 2 (final): All merge_l1_*.parquet files are merged locally into
+#               users_data.parquet (ZSTD level 19, bloom filters) and uploaded.
+#               L1 files are deleted after the final upload.
+#
+# Time safety: Merging stops MERGE_STOP_BUFFER seconds before the hard 6-hour
+#              kill.  If stopped mid-batch, the partially-merged working file is
+#              uploaded as a _partial file, recorded in the merge checkpoint, and
+#              seamlessly resumed (downloaded + more parts appended) next run.
+#
+# Disk usage:  Peak ≈ current working file + 1 downloaded part ≈ safe on 90 GB.
+#              rclone uses --no-traverse + --buffer-size 32M (no disk cache).
+# ════════════════════════════════════════════════════════════════════════════════
 
-    tmp_part   = WORK_DIR / '_tmp_merge_part.parquet'
-    final_path = WORK_DIR / FINAL_FNAME
-    upload_ok  = False   # track whether upload succeeded
+L1_BATCH_SIZE            = 20           # original parts per L1 batch
+MERGE_STOP_BUFFER        = 25 * 60      # stop merge 25 min before run limit
+MERGE_CHECKPOINT_FNAME   = 'merge_checkpoint.json'
+_MERGE_CP_REMOTE         = f'{RCLONE_REMOTE}:{DEST_FOLDER}/{MERGE_CHECKPOINT_FNAME}'
+_MERGE_CP_LOCAL          = WORK_DIR / MERGE_CHECKPOINT_FNAME
 
-    for p in (tmp_part, final_path):
-        if p.exists():
-            p.unlink()
 
-    merge_writer: pq.ParquetWriter | None = None
-    part_names: list[str] = []
-    total_rows = 0
+# ── Merge checkpoint helpers ──────────────────────────────────────────────────
 
+def load_merge_checkpoint(rclone_cmd: str) -> dict | None:
     try:
-        log('📋 Listing part files on Drive...')
+        if _MERGE_CP_LOCAL.exists():
+            _MERGE_CP_LOCAL.unlink()
         r = subprocess.run(
-            [rclone_cmd, 'lsf', f'{RCLONE_REMOTE}:{DEST_FOLDER}/',
-             '--include', 'part_*.parquet'],
+            [rclone_cmd, 'copyto', _MERGE_CP_REMOTE, str(_MERGE_CP_LOCAL),
+             '--retries', '5'],
             capture_output=True, text=True, timeout=120,
         )
-        if r.returncode != 0:
-            log(f'❌ Could not list parts: {r.stderr[:300]}')
-            return False
+        if r.returncode == 0 and _MERGE_CP_LOCAL.exists():
+            with open(_MERGE_CP_LOCAL, encoding='utf-8') as f:
+                cp = json.load(f)
+            log(f'📌 Merge checkpoint: phase={cp.get("phase")}, '
+                f'l1_done={len(cp.get("l1_batches_done", []))} batches')
+            return cp
+    except Exception as e:
+        log(f'⚠️  Merge checkpoint load failed ({e}) — starting merge fresh')
+    finally:
+        if _MERGE_CP_LOCAL.exists():
+            _MERGE_CP_LOCAL.unlink()
+    return None
 
-        part_names = sorted(p.strip() for p in r.stdout.strip().splitlines() if p.strip())
-        if not part_names:
-            log('⚠️  No part files found to merge')
-            return False
-        log(f'📥 Found {len(part_names)} parts to merge')
 
-        merge_writer = pq.ParquetWriter(
-            str(final_path),
-            schema=SCHEMA,
-            compression='zstd',
-            compression_level=ZSTD_LEVEL,
-            use_dictionary=DICT_COLUMNS,
-            write_statistics=True,
-            version='2.6',
-            write_page_index=True,
-        )
-
-        for i, part_name in enumerate(part_names):
-            if should_stop():
-                log('⏰ Time limit reached during merge — will retry next run')
-                return False
-
-            log(f'📥 [{i+1}/{len(part_names)}] Downloading {part_name}...')
-            r = subprocess.run(
-                [rclone_cmd, 'copyto',
-                 f'{RCLONE_REMOTE}:{DEST_FOLDER}/{part_name}',
-                 str(tmp_part),
-                 '--retries', '5', '--low-level-retries', '10'],
-                capture_output=True, text=True, timeout=1800,
-            )
-            if r.returncode != 0:
-                log(f'❌ Failed to download {part_name}: {r.stderr[:200]}')
-                return False
-
-            part_table = pq.read_table(str(tmp_part), schema=SCHEMA)
-            merge_writer.write_table(part_table)
-            total_rows += part_table.num_rows
-            log(f'   ✅ Merged {part_name}: {part_table.num_rows:,} rows '
-                f'(running total: {total_rows:,})')
-            del part_table
-            gc.collect()
-            tmp_part.unlink()
-
-        merge_writer.close()
-        merge_writer = None
-
-        if not final_path.exists():
-            log('❌ Merged file was not created')
-            return False
-
-        final_size = final_path.stat().st_size
-        log(f'📦 Merge complete: {total_rows:,} rows, {fmt_bytes(final_size)}')
-
-        log(f'☁️  Uploading {FINAL_FNAME} to Drive...')
+def save_merge_checkpoint(rclone_cmd: str, data: dict) -> bool:
+    data['saved_at'] = datetime.now(timezone.utc).isoformat()
+    try:
+        with open(_MERGE_CP_LOCAL, 'w', encoding='utf-8') as f:
+            json.dump(data, f, indent=2)
         r = subprocess.run(
-            [rclone_cmd, 'copyto', str(final_path),
-             f'{RCLONE_REMOTE}:{DEST_FOLDER}/{FINAL_FNAME}',
-             '--retries', '10', '--low-level-retries', '10',
-             '--retries-sleep', '15s', '--transfers', '4'],
-            capture_output=True, text=True, timeout=7200,
+            [rclone_cmd, 'copyto', str(_MERGE_CP_LOCAL), _MERGE_CP_REMOTE,
+             '--retries', '5', '--low-level-retries', '10'],
+            capture_output=True, text=True, timeout=120,
         )
-        if r.returncode != 0:
-            log(f'❌ Failed to upload merged file: {r.stderr[:300]}')
-            return False
+        if r.returncode == 0:
+            log(f'💾 Merge checkpoint saved: {data.get("phase")}')
+            return True
+        log(f'⚠️  Merge checkpoint upload failed: {r.stderr[:200]}')
+    except Exception as e:
+        log(f'⚠️  Merge checkpoint save error: {e}')
+    finally:
+        if _MERGE_CP_LOCAL.exists():
+            _MERGE_CP_LOCAL.unlink()
+    return False
 
-        log('✅ Merged file uploaded successfully')
-        upload_ok = True   # mark success BEFORE cleanup
 
-        log('🗑️  Removing intermediate part files from Drive...')
-        for part_name in part_names:
-            subprocess.run(
-                [rclone_cmd, 'deletefile', f'{RCLONE_REMOTE}:{DEST_FOLDER}/{part_name}'],
-                capture_output=True, timeout=60,
-            )
+def delete_merge_checkpoint(rclone_cmd: str) -> None:
+    try:
+        subprocess.run([rclone_cmd, 'deletefile', _MERGE_CP_REMOTE],
+                       capture_output=True, timeout=60)
+        log('🗑️  Merge checkpoint deleted')
+    except Exception:
+        pass
 
+
+def merge_time_ok() -> bool:
+    """True when there is still enough time to do more merge work."""
+    return (time_remaining() - MERGE_STOP_BUFFER) > 0
+
+
+# ── rclone helpers used only during merge ────────────────────────────────────
+
+def _rclone_dl(rclone_cmd: str, remote_name: str, local_path: Path) -> bool:
+    """Download DEST_FOLDER/remote_name → local_path. Returns success."""
+    log(f'📥 Downloading {remote_name}...')
+    t0 = time.time()
+    r = subprocess.run(
+        [rclone_cmd, 'copyto',
+         f'{RCLONE_REMOTE}:{DEST_FOLDER}/{remote_name}',
+         str(local_path),
+         '--retries', '5', '--low-level-retries', '10',
+         '--no-traverse', '--buffer-size', '32M'],
+        capture_output=True, text=True, timeout=1800,
+    )
+    if r.returncode == 0 and local_path.exists():
+        sz = local_path.stat().st_size
+        log(f'   ✅ {fmt_bytes(sz)} in {fmt_dur(time.time() - t0)}')
         return True
+    log(f'   ❌ Download failed: {r.stderr[:200]}')
+    return False
+
+
+def _rclone_ul(rclone_cmd: str, local_path: Path, remote_name: str,
+               timeout: int = UPLOAD_TIMEOUT) -> bool:
+    """Upload local_path → DEST_FOLDER/remote_name. Returns success.
+
+    timeout: per-attempt subprocess timeout in seconds.
+             Use a larger value (e.g. 7200) for very large files.
+    """
+    sz = local_path.stat().st_size if local_path.exists() else 0
+    log(f'☁️  Uploading {remote_name} ({fmt_bytes(sz)})...')
+    t0 = time.time()
+    for attempt in range(UPLOAD_RETRIES):
+        r = subprocess.run(
+            [rclone_cmd, 'copyto', str(local_path),
+             f'{RCLONE_REMOTE}:{DEST_FOLDER}/{remote_name}',
+             '--retries', '3', '--low-level-retries', '10',
+             '--retries-sleep', '10s'],
+            capture_output=True, text=True, timeout=timeout,
+        )
+        if r.returncode == 0:
+            elapsed = time.time() - t0
+            speed = sz / elapsed if elapsed > 0 else 0
+            log(f'   ✅ Uploaded in {fmt_dur(elapsed)} ({fmt_bytes(speed)}/s)')
+            return True
+        log(f'   ⚠️  Upload attempt {attempt+1}/{UPLOAD_RETRIES}: {r.stderr[:150]}')
+        if attempt < UPLOAD_RETRIES - 1:
+            time.sleep(min(30 * (attempt + 1), 120))
+    return False
+
+
+def _rclone_rm(rclone_cmd: str, remote_name: str) -> None:
+    """Delete DEST_FOLDER/remote_name from Drive (best-effort, silent)."""
+    try:
+        subprocess.run(
+            [rclone_cmd, 'deletefile',
+             f'{RCLONE_REMOTE}:{DEST_FOLDER}/{remote_name}'],
+            capture_output=True, timeout=60,
+        )
+    except Exception:
+        pass
+
+
+def _list_remote(rclone_cmd: str, pattern: str) -> list[str]:
+    """Sorted list of files in DEST_FOLDER matching glob pattern."""
+    r = subprocess.run(
+        [rclone_cmd, 'lsf', f'{RCLONE_REMOTE}:{DEST_FOLDER}/',
+         '--include', pattern],
+        capture_output=True, text=True, timeout=120,
+    )
+    if r.returncode != 0:
+        return []
+    return sorted(p.strip() for p in r.stdout.strip().splitlines() if p.strip())
+
+
+# ── Parquet writer factories ──────────────────────────────────────────────────
+
+def _make_intermediate_writer(path: Path) -> pq.ParquetWriter:
+    """Fast ZSTD-3 writer for temporary L1 batch files."""
+    return pq.ParquetWriter(
+        str(path), schema=SCHEMA,
+        compression='zstd',
+        compression_level=PART_ZSTD_LEVEL,
+        use_dictionary=DICT_COLUMNS,
+        write_statistics=True,
+        version='2.6',
+        write_page_index=True,
+    )
+
+
+def _make_final_writer(path: Path) -> pq.ParquetWriter:
+    """ZSTD-19 writer with bloom filters for the final users_data.parquet."""
+    return pq.ParquetWriter(
+        str(path), schema=SCHEMA,
+        compression='zstd',
+        compression_level=ZSTD_LEVEL,
+        use_dictionary=DICT_COLUMNS,
+        write_statistics=True,
+        version='2.6',
+        write_page_index=True,
+        bloom_filter_columns=BLOOM_FILTER_COLUMNS,
+    )
+
+
+def _append_parquet(src: Path, writer: pq.ParquetWriter) -> int:
+    """Read src → append all rows to writer. Deletes src. Returns row count."""
+    tbl = pq.read_table(str(src), schema=SCHEMA)
+    writer.write_table(tbl)
+    n = tbl.num_rows
+    del tbl
+    gc.collect()
+    src.unlink(missing_ok=True)
+    return n
+
+
+# ════════════════════════════════════════════════════════════════════════════════
+# PHASE 1 — Merge original parts into L1 batch files
+# ════════════════════════════════════════════════════════════════════════════════
+
+def _merge_phase_l1(rclone_cmd: str, mcp: dict) -> str:
+    """
+    Process L1 batches: groups part_*.parquet → merge_l1_XXXXX.parquet.
+    Returns 'l1_done' when all batches complete, 'continue' to re-trigger.
+    """
+    all_parts:       list[str]  = mcp['all_parts']
+    l1_batches_done: list[str]  = mcp.get('l1_batches_done', [])
+    cur_batch_idx:   int        = mcp.get('current_batch_index', 0)
+    cur_merged:      list[str]  = mcp.get('current_batch_parts_merged', [])
+    cur_partial:     str | None = mcp.get('current_partial_name')
+
+    batches = [all_parts[i:i + L1_BATCH_SIZE]
+               for i in range(0, len(all_parts), L1_BATCH_SIZE)]
+
+    log(f'\n🔗 L1 phase: {len(all_parts)} parts → '
+        f'{len(batches)} batches of ≤{L1_BATCH_SIZE}')
+    log(f'   Batches done : {len(l1_batches_done)} / {len(batches)}')
+    log(f'   Resuming at  : batch {cur_batch_idx + 1}')
+
+    # Fixed-name temp paths — reused each batch, always cleaned up
+    WORK_TMP   = WORK_DIR / '_merge_l1_work.parquet'    # accumulator
+    PART_DL    = WORK_DIR / '_merge_part_dl.parquet'    # single downloaded part
+    PARTIAL_DL = WORK_DIR / '_merge_partial_dl.parquet' # resume: downloaded _partial
+
+    for batch_idx in range(cur_batch_idx, len(batches)):
+        batch_parts = batches[batch_idx]
+        l1_name     = f'merge_l1_{batch_idx + 1:05d}.parquet'
+
+        log(f'\n📦 L1 batch {batch_idx + 1}/{len(batches)}: '
+            f'{len(batch_parts)} parts → {l1_name}')
+
+        # Parts not yet folded into this batch's working file
+        already_done = set(cur_merged) if batch_idx == cur_batch_idx else set()
+        remaining    = [p for p in batch_parts if p not in already_done]
+        rows_in_batch = 0
+        writer: pq.ParquetWriter | None = None
+
+        # Clean any stale temp files from a previous interrupted run
+        for p in (WORK_TMP, PART_DL, PARTIAL_DL):
+            p.unlink(missing_ok=True)
+
+        try:
+            writer = _make_intermediate_writer(WORK_TMP)
+
+            # Seed writer with the partial upload from the previous run (if any)
+            if batch_idx == cur_batch_idx and cur_partial and remaining:
+                log(f'   ↩️  Resuming from partial: {cur_partial}')
+                if _rclone_dl(rclone_cmd, cur_partial, PARTIAL_DL):
+                    rows_in_batch += _append_parquet(PARTIAL_DL, writer)
+                    log(f'   📖 Partial had {rows_in_batch:,} rows — continuing')
+                else:
+                    log('   ⚠️  Partial download failed — re-merging batch from scratch')
+                    writer.close(); writer = None
+                    WORK_TMP.unlink(missing_ok=True)
+                    already_done = set()
+                    remaining    = list(batch_parts)
+                    cur_partial  = None
+                    writer = _make_intermediate_writer(WORK_TMP)
+
+            # Merge remaining parts one by one
+            for part_name in remaining:
+
+                # ── Time check: stop BEFORE starting the next download ────────
+                if not merge_time_ok():
+                    log(f'\n⏰ Time limit approaching — stopping before batch '
+                        f'{batch_idx + 1} ({len(already_done)}/{len(batch_parts)} '
+                        f'parts done, {rows_in_batch:,} rows so far)')
+                    writer.close(); writer = None
+                    if rows_in_batch == 0:
+                        # Nothing merged yet in this batch — no point uploading
+                        # an empty parquet file.  The checkpoint already records
+                        # which batches are fully done; next run will restart
+                        # this batch from scratch (no data loss).
+                        WORK_TMP.unlink(missing_ok=True)
+                        log('ℹ️  No rows in current batch — skipping partial upload')
+                    else:
+                        partial_name = f'merge_l1_{batch_idx + 1:05d}_partial.parquet'
+                        if _rclone_ul(rclone_cmd, WORK_TMP, partial_name):
+                            WORK_TMP.unlink(missing_ok=True)
+                            mcp.update({
+                                'phase':                      'l1_merging',
+                                'current_batch_index':         batch_idx,
+                                'current_batch_parts_merged':  list(already_done),
+                                'current_partial_name':        partial_name,
+                            })
+                            save_merge_checkpoint(rclone_cmd, mcp)
+                            log(f'✅ Progress saved as {partial_name} — resuming next run')
+                        else:
+                            WORK_TMP.unlink(missing_ok=True)
+                            log('❌ Partial upload failed — this batch progress is lost')
+                    return 'continue'
+
+                # Download part → merge → auto-deleted by _append_parquet
+                if not _rclone_dl(rclone_cmd, part_name, PART_DL):
+                    writer.close(); writer = None
+                    for p in (WORK_TMP, PART_DL): p.unlink(missing_ok=True)
+                    log(f'❌ Download of {part_name} failed — will retry next run')
+                    return 'continue'
+
+                n = _append_parquet(PART_DL, writer)   # deletes PART_DL
+                rows_in_batch += n
+                already_done.add(part_name)
+                log(f'   ✅ {part_name}: {n:,} rows '
+                    f'(batch total: {rows_in_batch:,})')
+
+                # Checkpoint after each part — survives SIGKILL between parts
+                mcp.update({
+                    'phase':                      'l1_merging',
+                    'current_batch_index':         batch_idx,
+                    'current_batch_parts_merged':  list(already_done),
+                    'current_partial_name':        None,
+                })
+                save_merge_checkpoint(rclone_cmd, mcp)
+
+            # ── Full batch done — upload L1 file ──────────────────────────────
+            writer.close(); writer = None
+            log(f'📦 Batch {batch_idx + 1} complete: '
+                f'{rows_in_batch:,} rows → uploading {l1_name}')
+
+            if not _rclone_ul(rclone_cmd, WORK_TMP, l1_name):
+                WORK_TMP.unlink(missing_ok=True)
+                log(f'❌ Upload of {l1_name} failed — will retry next run')
+                return 'continue'
+            WORK_TMP.unlink(missing_ok=True)
+
+            # Delete the 20 source parts from Drive immediately
+            log(f'🗑️  Deleting {len(batch_parts)} source parts from Drive...')
+            for p in batch_parts:
+                _rclone_rm(rclone_cmd, p)
+
+            # Clean up any superseded _partial for this batch
+            if cur_partial:
+                _rclone_rm(rclone_cmd, cur_partial)
+                cur_partial = None
+
+            # Advance checkpoint to the next batch
+            mcp.update({
+                'phase':                      'l1_merging',
+                'l1_batches_done':             mcp.get('l1_batches_done', []) + [l1_name],
+                'current_batch_index':         batch_idx + 1,
+                'current_batch_parts_merged':  [],
+                'current_partial_name':        None,
+            })
+            save_merge_checkpoint(rclone_cmd, mcp)
+            log(f'✅ L1 batch {batch_idx + 1}/{len(batches)} done → {l1_name}')
+
+            # Reset resume-state for the upcoming batch
+            cur_merged  = []
+            cur_partial = None
+
+        except Exception as e:
+            import traceback
+            log(f'❌ L1 batch {batch_idx + 1} error: {e}')
+            log(traceback.format_exc())
+            if writer is not None:
+                try: writer.close()
+                except Exception: pass
+            for p in (WORK_TMP, PART_DL, PARTIAL_DL):
+                p.unlink(missing_ok=True)
+            return 'continue'
+
+    log(f'\n✅ All {len(batches)} L1 batches complete!')
+    return 'l1_done'
+
+
+# ════════════════════════════════════════════════════════════════════════════════
+# PHASE 2 — Merge all L1 files into final users_data.parquet
+# ════════════════════════════════════════════════════════════════════════════════
+
+def _merge_phase_final(rclone_cmd: str, mcp: dict) -> str:
+    """
+    Merge all merge_l1_*.parquet → users_data.parquet (ZSTD-19, bloom filters).
+    Returns 'complete' or 'continue'.
+    """
+    l1_files:        list[str]  = mcp.get('l1_files', [])
+    l1_files_merged: list[str]  = mcp.get('l1_files_merged', [])
+    cur_partial:     str | None = mcp.get('current_partial_name')
+
+    # First entry into final phase — discover all L1 files on Drive
+    if not l1_files:
+        l1_files = [f for f in _list_remote(rclone_cmd, 'merge_l1_*.parquet')
+                    if '_partial' not in f]
+        if not l1_files:
+            log('❌ No L1 files found for final merge')
+            return 'continue'
+        mcp['l1_files'] = l1_files
+        log(f'📋 Found {len(l1_files)} L1 files for final merge')
+
+    remaining = [f for f in l1_files if f not in l1_files_merged]
+    log(f'\n🔗 Final merge: {len(l1_files)} L1 files | '
+        f'{len(l1_files_merged)} done | {len(remaining)} remaining')
+
+    WORK_TMP   = WORK_DIR / '_final_merge_work.parquet'
+    L1_DL      = WORK_DIR / '_l1_dl.parquet'
+    PARTIAL_DL = WORK_DIR / '_final_partial_dl.parquet'
+
+    for p in (WORK_TMP, L1_DL, PARTIAL_DL):
+        p.unlink(missing_ok=True)
+
+    rows_total = 0
+    writer: pq.ParquetWriter | None = None
+
+    try:
+        writer = _make_final_writer(WORK_TMP)
+
+        # Seed from a partial uploaded during a previous interrupted run
+        if cur_partial and remaining:
+            log(f'   ↩️  Resuming final merge from partial: {cur_partial}')
+            if _rclone_dl(rclone_cmd, cur_partial, PARTIAL_DL):
+                rows_total += _append_parquet(PARTIAL_DL, writer)
+                log(f'   📖 Partial had {rows_total:,} rows — continuing')
+            else:
+                log('   ⚠️  Partial download failed — rebuilding from scratch')
+                writer.close(); writer = None
+                WORK_TMP.unlink(missing_ok=True)
+                cur_partial     = None
+                l1_files_merged = []
+                remaining       = list(l1_files)
+                writer = _make_final_writer(WORK_TMP)
+
+        for l1_name in remaining:
+
+            # ── Time check ────────────────────────────────────────────────────
+            if not merge_time_ok():
+                log(f'\n⏰ Time limit approaching — uploading partial final '
+                    f'({len(l1_files_merged)}/{len(l1_files)} L1 files done, '
+                    f'{rows_total:,} rows)')
+                writer.close(); writer = None
+                partial_name = 'users_data_partial.parquet'
+                if _rclone_ul(rclone_cmd, WORK_TMP, partial_name):
+                    WORK_TMP.unlink(missing_ok=True)
+                    mcp.update({
+                        'phase':               'final_merging',
+                        'l1_files_merged':      list(l1_files_merged),
+                        'current_partial_name': partial_name,
+                    })
+                    save_merge_checkpoint(rclone_cmd, mcp)
+                    log('✅ Partial final saved — resuming next run')
+                else:
+                    WORK_TMP.unlink(missing_ok=True)
+                    log('❌ Partial final upload failed — progress lost')
+                L1_DL.unlink(missing_ok=True)
+                return 'continue'
+
+            if not _rclone_dl(rclone_cmd, l1_name, L1_DL):
+                writer.close(); writer = None
+                for p in (WORK_TMP, L1_DL): p.unlink(missing_ok=True)
+                log(f'❌ Download of {l1_name} failed — will retry next run')
+                return 'continue'
+
+            n = _append_parquet(L1_DL, writer)   # deletes L1_DL
+            rows_total += n
+            l1_files_merged = list(l1_files_merged) + [l1_name]
+            log(f'   ✅ {l1_name}: {n:,} rows (total: {rows_total:,})')
+
+            # Checkpoint after every L1 file
+            mcp.update({
+                'phase':               'final_merging',
+                'l1_files_merged':      list(l1_files_merged),
+                'current_partial_name': None,
+            })
+            save_merge_checkpoint(rclone_cmd, mcp)
+
+        # ── All L1 files merged — upload the final file ───────────────────────
+        writer.close(); writer = None
+        final_size = WORK_TMP.stat().st_size if WORK_TMP.exists() else 0
+        log(f'\n📦 Final merge complete: {rows_total:,} rows, '
+            f'{fmt_bytes(final_size)}')
+
+        # Use a 2-hour timeout: the final merged file can be 20-80 GB and
+        # may take 30-120 min to upload at Drive speeds. The default
+        # UPLOAD_TIMEOUT (60 min) is too short for files of this size.
+        if not _rclone_ul(rclone_cmd, WORK_TMP, FINAL_FNAME, timeout=7200):
+            WORK_TMP.unlink(missing_ok=True)
+            log('❌ Final file upload failed — will retry next run')
+            return 'continue'
+        WORK_TMP.unlink(missing_ok=True)
+        log(f'✅ {FINAL_FNAME} uploaded successfully!')
+
+        # Delete all L1 files and any leftover partial from Drive
+        log(f'🗑️  Deleting {len(l1_files)} L1 files from Drive...')
+        for f in l1_files:
+            _rclone_rm(rclone_cmd, f)
+        if cur_partial:
+            _rclone_rm(rclone_cmd, 'users_data_partial.parquet')
+
+        return 'complete'
 
     except Exception as e:
         import traceback
-        log(f'❌ Merge failed: {e}')
+        log(f'❌ Final merge error: {e}')
         log(traceback.format_exc())
-        return False
+        if writer is not None:
+            try: writer.close()
+            except Exception: pass
+        for p in (WORK_TMP, L1_DL, PARTIAL_DL):
+            p.unlink(missing_ok=True)
+        return 'continue'
 
-    finally:
-        if merge_writer is not None:
-            try:
-                merge_writer.close()
-            except Exception:
-                pass
-        # Only delete the tmp download file, never the final merged file.
-        # (Previous bug: final_path was deleted here even after successful upload.)
-        if tmp_part.exists():
-            try:
-                tmp_part.unlink()
-            except Exception:
-                pass
-        # Delete local final only if upload FAILED (it's incomplete/corrupt)
-        if not upload_ok and final_path.exists():
-            try:
-                final_path.unlink()
-            except Exception:
-                pass
+
+# ════════════════════════════════════════════════════════════════════════════════
+# MERGE ENTRYPOINT
+# ════════════════════════════════════════════════════════════════════════════════
+
+def do_merge(rclone_cmd: str) -> str:
+    """
+    Orchestrate the 2-level merge.  Returns 'complete' or 'continue'.
+
+    Run 0 (first entry):
+      • Bootstraps merge_checkpoint.json on Drive with the full parts list
+      • Starts L1 phase
+
+    Subsequent runs:
+      • Loads merge_checkpoint.json → resumes at exact part / batch / phase
+
+    Merge checkpoint schema
+    ─────────────────────────────────────────────────────────────────────────────
+    phase                      : 'l1_merging' | 'final_merging'
+    all_parts                  : [part_*.parquet names]          (L1 only)
+    l1_batches_done            : [merge_l1_*.parquet names done] (L1 only)
+    current_batch_index        : int  0-based                    (L1 only)
+    current_batch_parts_merged : [part names merged so far]      (L1 only)
+    current_partial_name       : filename of in-progress partial on Drive | null
+    l1_files                   : [merge_l1_*.parquet names]      (final only)
+    l1_files_merged            : [l1 files merged so far]        (final only)
+    saved_at                   : ISO timestamp
+    """
+    log('\n' + '═' * 65)
+    log('  MERGE PHASE — 2-level hierarchical merge')
+    log(f'  L1 batch size : {L1_BATCH_SIZE} parts/batch')
+    log(f'  Time buffer   : {MERGE_STOP_BUFFER // 60} min before hard kill')
+    log('═' * 65)
+
+    mcp = load_merge_checkpoint(rclone_cmd)
+    if mcp is None:
+        log('📋 First merge run — discovering part files on Drive...')
+        all_parts = _list_remote(rclone_cmd, 'part_*.parquet')
+        if not all_parts:
+            # No parts and no merge checkpoint means either:
+            #   (a) merge fully completed but convert_checkpoint.json wasn't
+            #       cleaned up yet (SIGKILL between delete_merge_checkpoint and
+            #       delete_checkpoint) — check Drive for the final file.
+            #   (b) something genuinely went wrong.
+            # In case (a) we must NOT return 'continue' or the safety-net will
+            # re-trigger this run forever (infinite loop).
+            log('⚠️  No part files found — checking if final file already exists...')
+            existing_final = _list_remote(rclone_cmd, FINAL_FNAME)
+            if existing_final:
+                log(f'✅ {FINAL_FNAME} already on Drive — merge was already complete!')
+                log('   (convert_checkpoint.json will be cleaned up by caller)')
+                return 'complete'
+            log('❌ No part files and no final file found — cannot merge')
+            return 'continue'
+        n_batches = (len(all_parts) + L1_BATCH_SIZE - 1) // L1_BATCH_SIZE
+        log(f'   Found {len(all_parts)} parts → '
+            f'{n_batches} L1 batches of ≤{L1_BATCH_SIZE}')
+        mcp = {
+            'phase':                      'l1_merging',
+            'all_parts':                  all_parts,
+            'l1_batches_done':            [],
+            'current_batch_index':         0,
+            'current_batch_parts_merged':  [],
+            'current_partial_name':        None,
+            'l1_files':                    [],
+            'l1_files_merged':             [],
+        }
+        save_merge_checkpoint(rclone_cmd, mcp)
+
+    phase = mcp.get('phase', 'l1_merging')
+
+    if phase == 'l1_merging':
+        result = _merge_phase_l1(rclone_cmd, mcp)
+        if result == 'continue':
+            return 'continue'
+        # L1 done — transition to final phase
+        mcp['phase'] = 'final_merging'
+        save_merge_checkpoint(rclone_cmd, mcp)
+        phase = 'final_merging'
+
+    if phase == 'final_merging':
+        result = _merge_phase_final(rclone_cmd, mcp)
+        if result == 'complete':
+            delete_merge_checkpoint(rclone_cmd)
+            return 'complete'
+        return 'continue'
+
+    log(f'⚠️  Unknown merge phase "{phase}" — cannot continue')
+    return 'continue'
 
 
 # ════════════════════════════════════════════════════════════════════════════════
@@ -663,11 +1127,11 @@ def run_conversion(rclone_cmd: str, force_restart: bool) -> str:
         checkpoint = load_checkpoint(rclone_cmd)
         if checkpoint and checkpoint.get('status') == 'converting_complete':
             log('📌 Conversion complete, proceeding to merge...')
-            if merge_parts(rclone_cmd):
+            result = do_merge(rclone_cmd)
+            if result == 'complete':
                 delete_checkpoint(rclone_cmd)
                 return 'complete'
-            else:
-                return 'continue'
+            return 'continue'
     else:
         log('\n⚠️  FORCE_RESTART=true — ignoring checkpoint')
 
@@ -920,13 +1384,13 @@ def run_conversion(rclone_cmd: str, force_restart: bool) -> str:
             log('\n🎉 Conversion complete! Starting merge...')
             save_checkpoint(rclone_cmd, total_pos, writer.total_written,
                             writer.part_num, status='converting_complete')
-            if time_remaining() > 1800:
-                if merge_parts(rclone_cmd):
+            if time_remaining() > (MERGE_STOP_BUFFER + 300):
+                result = do_merge(rclone_cmd)
+                if result == 'complete':
                     delete_checkpoint(rclone_cmd)
                     return 'complete'
-                else:
-                    log('⚠️  Merge incomplete — will continue next run')
-                    return 'continue'
+                log('⚠️  Merge incomplete — will continue next run')
+                return 'continue'
             else:
                 log('⏰ Not enough time for merge — will merge next run')
                 return 'continue'
