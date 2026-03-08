@@ -701,7 +701,14 @@ def _make_intermediate_writer(path: Path) -> pq.ParquetWriter:
 
 
 def _make_final_writer(path: Path) -> pq.ParquetWriter:
-    """ZSTD-19 writer with bloom filters for the final users_data.parquet."""
+    """ZSTD-19 writer for the final users_data.parquet.
+
+    bloom_filter_columns removed: the ParquetWriter C-level __cinit__ in
+    pyarrow >=17 no longer accepts this as a constructor keyword — it raises
+    TypeError at runtime.  write_statistics=True + write_page_index=True
+    already provide fine-grained min/max predicate pushdown per data page,
+    which covers the same filtering use-case for our string columns.
+    """
     return pq.ParquetWriter(
         str(path), schema=SCHEMA,
         compression='zstd',
@@ -710,7 +717,6 @@ def _make_final_writer(path: Path) -> pq.ParquetWriter:
         write_statistics=True,
         version='2.6',
         write_page_index=True,
-        bloom_filter_columns=BLOOM_FILTER_COLUMNS,
     )
 
 
@@ -849,8 +855,33 @@ def _merge_phase_l1(rclone_cmd: str, mcp: dict) -> str:
                 f'{rows_in_batch:,} rows → uploading {l1_name}')
 
             if not _rclone_ul(rclone_cmd, WORK_TMP, l1_name):
-                WORK_TMP.unlink(missing_ok=True)
-                log(f'❌ Upload of {l1_name} failed — will retry next run')
+                # Upload failed.  Try saving work as a _partial so next run
+                # can re-attempt the upload without re-downloading all parts.
+                partial_name = f'merge_l1_{batch_idx + 1:05d}_partial.parquet'
+                log(f'⚠️  Upload failed — trying to save progress as {partial_name}...')
+                if _rclone_ul(rclone_cmd, WORK_TMP, partial_name):
+                    WORK_TMP.unlink(missing_ok=True)
+                    mcp.update({
+                        'phase':                      'l1_merging',
+                        'current_batch_index':         batch_idx,
+                        'current_batch_parts_merged':  list(already_done),
+                        'current_partial_name':        partial_name,
+                    })
+                    save_merge_checkpoint(rclone_cmd, mcp)
+                    log(f'✅ Progress saved as {partial_name} — re-uploading next run')
+                else:
+                    # Even saving the partial failed (Drive fully quota-limited).
+                    # Reset checkpoint so next run re-merges from scratch.
+                    # Source parts are still on Drive — no data loss.
+                    WORK_TMP.unlink(missing_ok=True)
+                    mcp.update({
+                        'phase':                      'l1_merging',
+                        'current_batch_index':         batch_idx,
+                        'current_batch_parts_merged':  [],
+                        'current_partial_name':        None,
+                    })
+                    save_merge_checkpoint(rclone_cmd, mcp)
+                    log(f'❌ Partial save also failed — reset checkpoint, will re-merge next run')
                 return 'continue'
             WORK_TMP.unlink(missing_ok=True)
 
@@ -928,6 +959,34 @@ def _merge_phase_final(rclone_cmd: str, mcp: dict) -> str:
     for p in (WORK_TMP, L1_DL, PARTIAL_DL):
         p.unlink(missing_ok=True)
 
+    # ── Special case: all L1 files already merged, partial on Drive ───────────
+    # This happens when the final upload failed last run: we saved the full
+    # merged file as users_data_partial.parquet. Just re-upload it directly
+    # instead of re-merging everything from scratch.
+    if not remaining and cur_partial:
+        log(f'♻️  All L1 files already merged — re-uploading {cur_partial} as {FINAL_FNAME}')
+        if _rclone_dl(rclone_cmd, cur_partial, WORK_TMP):
+            if _rclone_ul(rclone_cmd, WORK_TMP, FINAL_FNAME, timeout=7200):
+                WORK_TMP.unlink(missing_ok=True)
+                log(f'✅ {FINAL_FNAME} uploaded successfully!')
+                log(f'🗑️  Deleting {len(l1_files)} L1 files from Drive...')
+                for f in l1_files:
+                    _rclone_rm(rclone_cmd, f)
+                _rclone_rm(rclone_cmd, cur_partial)
+                return 'complete'
+            else:
+                WORK_TMP.unlink(missing_ok=True)
+                log('❌ Re-upload failed — will retry next run')
+                return 'continue'
+        else:
+            # Partial not available — reset and fall through to full re-merge
+            log('⚠️  Partial not available on Drive — resetting for full re-merge')
+            l1_files_merged = []
+            remaining = list(l1_files)
+            cur_partial = None
+            mcp.update({'l1_files_merged': [], 'current_partial_name': None})
+            save_merge_checkpoint(rclone_cmd, mcp)
+
     rows_total = 0
     writer: pq.ParquetWriter | None = None
 
@@ -1002,8 +1061,30 @@ def _merge_phase_final(rclone_cmd: str, mcp: dict) -> str:
         # may take 30-120 min to upload at Drive speeds. The default
         # UPLOAD_TIMEOUT (60 min) is too short for files of this size.
         if not _rclone_ul(rclone_cmd, WORK_TMP, FINAL_FNAME, timeout=7200):
-            WORK_TMP.unlink(missing_ok=True)
-            log('❌ Final file upload failed — will retry next run')
+            # Upload failed. Try saving the full merged file as a partial so
+            # next run only needs to re-upload, not re-merge all L1 files.
+            partial_name = 'users_data_partial.parquet'
+            log(f'⚠️  Final upload failed — trying to save progress as {partial_name}...')
+            if _rclone_ul(rclone_cmd, WORK_TMP, partial_name, timeout=7200):
+                WORK_TMP.unlink(missing_ok=True)
+                mcp.update({
+                    'phase':               'final_merging',
+                    'l1_files_merged':      list(l1_files_merged),
+                    'current_partial_name': partial_name,
+                })
+                save_merge_checkpoint(rclone_cmd, mcp)
+                log(f'✅ Progress saved as {partial_name} — re-uploading next run')
+            else:
+                # Even saving the partial failed. Reset so next run re-merges
+                # from scratch. L1 files are still on Drive — no data loss.
+                WORK_TMP.unlink(missing_ok=True)
+                mcp.update({
+                    'phase':               'final_merging',
+                    'l1_files_merged':      [],
+                    'current_partial_name': None,
+                })
+                save_merge_checkpoint(rclone_cmd, mcp)
+                log('❌ Partial save also failed — reset checkpoint, will re-merge next run')
             return 'continue'
         WORK_TMP.unlink(missing_ok=True)
         log(f'✅ {FINAL_FNAME} uploaded successfully!')
