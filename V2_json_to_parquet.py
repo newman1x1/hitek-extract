@@ -340,7 +340,8 @@ def save_checkpoint(rclone_cmd: str, total_bytes: int, records_written: int,
             json.dump(cp, f, indent=2)
         r = subprocess.run(
             [rclone_cmd, 'copyto', str(_CHECKPOINT_LOCAL), _CHECKPOINT_REMOTE,
-             '--retries', '5', '--low-level-retries', '10'],
+             '--retries', '5', '--low-level-retries', '10',
+             '--drive-chunk-size', '256M'],
             capture_output=True, text=True, timeout=120,
         )
         if r.returncode == 0:
@@ -472,7 +473,8 @@ class ParquetPartWriter:
                 r = subprocess.run(
                     [self._rclone, 'copyto', str(path), dest,
                      '--retries', '3', '--low-level-retries', '10',
-                     '--retries-sleep', '10s', '--transfers', '4'],
+                     '--retries-sleep', '10s', '--transfers', '4',
+                     '--drive-chunk-size', '256M'],
                     capture_output=True, text=True, timeout=UPLOAD_TIMEOUT,
                 )
                 if r.returncode == 0:
@@ -577,7 +579,8 @@ def save_merge_checkpoint(rclone_cmd: str, data: dict) -> bool:
             json.dump(data, f, indent=2)
         r = subprocess.run(
             [rclone_cmd, 'copyto', str(_MERGE_CP_LOCAL), _MERGE_CP_REMOTE,
-             '--retries', '5', '--low-level-retries', '10'],
+             '--retries', '5', '--low-level-retries', '10',
+             '--drive-chunk-size', '256M'],
             capture_output=True, text=True, timeout=120,
         )
         if r.returncode == 0:
@@ -643,7 +646,8 @@ def _rclone_ul(rclone_cmd: str, local_path: Path, remote_name: str,
             [rclone_cmd, 'copyto', str(local_path),
              f'{RCLONE_REMOTE}:{DEST_FOLDER}/{remote_name}',
              '--retries', '3', '--low-level-retries', '10',
-             '--retries-sleep', '10s'],
+             '--retries-sleep', '10s',
+             '--drive-chunk-size', '256M'],
             capture_output=True, text=True, timeout=timeout,
         )
         if r.returncode == 0:
