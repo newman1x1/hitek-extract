@@ -1,0 +1,174 @@
+name: JSON Schema Analyzer (streaming, resumable, auto-continue)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# What this workflow does
+# ─────────────────────────────────────────────────────────────────────────────
+# Streams Gdrive:users_data_extracted/users_data.json (446 GB) entirely via
+# rclone (never touches the 90 GB runner disk for the source file) and builds
+# a complete schema report covering EVERY field in EVERY record:
+#
+#   schema_report.json  — full machine-readable report (all stats)
+#   schema_report.txt   — human-readable summary (sorted by presence %)
+#   schema_report.csv   — one row per field, spreadsheet-friendly
+#
+# Per field the report captures:
+#   • presence rate, null rate, missing count
+#   • full type distribution (string / integer / float / boolean / object / array / null)
+#   • HyperLogLog distinct-value estimate + exact distinct count if ≤ 500
+#   • up to 20 sample values
+#   • string stats: min/max/avg length, pattern detection (email, phone, date,
+#     URL, MongoDB OID, UUID, IPv4, numeric ID, hex string)
+#   • number stats: min, max, mean, integer-only flag
+#   • boolean stats: true/false counts and percentages
+#   • array stats: min/max/avg element count, element type distribution
+#   • nested object paths (dot-notation, e.g. "_id.$oid") up to depth 8
+#   • array element paths (e.g. "tags[].name") up to depth 8
+#
+# KEY FEATURES:
+#   • ZERO disk usage for source — pure streaming via rclone cat
+#   • RESUMABLE — exact byte-offset checkpoint on Drive, reloaded each run
+#   • AUTO-CONTINUE — chains runs automatically until 100% complete
+#   • HEARTBEAT — prints every 30 s so GHA never thinks the job is stalled
+#   • STARTUP CHECKPOINT — written before streaming begins so safety-net
+#     can always find a checkpoint even after a first-5-min SIGKILL
+#   • GRACEFUL SHUTDOWN — SIGTERM/SIGINT flushes state and saves checkpoint
+#
+# USAGE:
+#   1. Trigger once manually (workflow_dispatch)
+#   2. Workflow auto-continues until the entire file is analyzed
+#   3. Final reports appear in Gdrive:users_data_parquet/
+#
+# Force restart from scratch:
+#   Trigger with force_restart = true
+#
+# Required secrets:
+#   RCLONE_CONF — base64-encoded rclone config
+#                 (generate: base64 -w0 ~/.config/rclone/rclone.conf)
+#   GH_PAT      — classic Personal Access Token with 'repo' scope
+#                 (for reliable repository_dispatch auto-continuation)
+#
+# Required repository setting:
+#   Settings → Actions → General → Workflow permissions
+#   → "Read and write permissions"   ← needed for GITHUB_TOKEN fallback
+# ─────────────────────────────────────────────────────────────────────────────
+
+on:
+  # Manual trigger with options
+  workflow_dispatch:
+    inputs:
+      force_restart:
+        description: 'Ignore checkpoint and re-analyze from scratch'
+        required: false
+        default: 'false'
+        type: choice
+        options:
+          - 'false'
+          - 'true'
+
+  # Auto-triggered by previous run when analysis is not yet complete
+  repository_dispatch:
+    types: [continue_schema_analysis]
+
+# Prevent two runs analyzing in parallel (would corrupt the checkpoint)
+concurrency:
+  group: json-schema-analyzer
+  cancel-in-progress: false
+
+jobs:
+  analyze:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360        # 6-hour hard cap; script stops at 5h 25m
+
+    permissions:
+      contents: write           # needed to fire repository_dispatch continuation
+
+    steps:
+      # ── 1. Checkout ─────────────────────────────────────────────────────────
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ── 2. Python ───────────────────────────────────────────────────────────
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      # ── 3. rclone ───────────────────────────────────────────────────────────
+      - name: Install rclone
+        run: |
+          curl -fsSL https://rclone.org/install.sh | sudo bash
+          rclone version
+
+      # ── 4. rclone config ────────────────────────────────────────────────────
+      - name: Configure rclone
+        env:
+          RCLONE_CONF: ${{ secrets.RCLONE_CONF }}
+        run: |
+          mkdir -p ~/.config/rclone
+          echo "$RCLONE_CONF" | base64 -d > ~/.config/rclone/rclone.conf
+          echo "✅ rclone config written"
+          rclone listremotes
+
+      # ── 5. Run schema analyzer ──────────────────────────────────────────────
+      - name: Analyze JSON schema
+        id: analyze
+        env:
+          FORCE_RESTART: ${{ github.event.inputs.force_restart || 'false' }}
+          # GH_PAT: classic PAT with 'repo' scope — preferred for auto-continuation.
+          # Falls back to GITHUB_TOKEN (requires "Read and write permissions").
+          GH_PAT:             ${{ secrets.GH_PAT }}
+          GITHUB_TOKEN:       ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY:  ${{ github.repository }}
+        run: python3 json_schema_analyzer.py
+
+      # ── 6. Upload checkpoint as artifact ────────────────────────────────────
+      - name: Upload run artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: schema-run-${{ github.run_number }}-${{ github.run_attempt }}
+          path: |
+            schema_checkpoint.json
+            schema_report.json
+            schema_report.txt
+            schema_report.csv
+            *.log
+          retention-days: 14
+          if-no-files-found: ignore
+
+      # ── 7. Safety-net continuation ──────────────────────────────────────────
+      # If the analyze step was hard-killed (SIGKILL, runner OOM, etc.) before
+      # Python's own trigger_next_run() could fire, this shell step fires the
+      # next run instead.  When the Python step exits cleanly (outcome==success)
+      # Python has already handled continuation — this step is a fast no-op.
+      - name: Ensure auto-continuation on hard kill
+        if: always()
+        env:
+          GH_PAT:       ${{ secrets.GH_PAT }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if [ "${{ steps.analyze.outcome }}" = "success" ]; then
+            echo "✅ Analyze step succeeded — Python handled continuation"
+            exit 0
+          fi
+
+          echo "⚠️  Analyze step outcome: '${{ steps.analyze.outcome }}'"
+          echo "    Checking Drive for checkpoint..."
+
+          # Prefer GH_PAT over GITHUB_TOKEN for reliable dispatch
+          DISPATCH_TOKEN="${GH_PAT:-$GITHUB_TOKEN}"
+          TOKEN_TYPE=$( [ -n "$GH_PAT" ] && echo "GH_PAT" || echo "GITHUB_TOKEN" )
+          echo "Using token type: $TOKEN_TYPE"
+
+          if rclone lsf "Gdrive:users_data_parquet/schema_checkpoint.json" 2>/dev/null \
+               | grep -q "schema_checkpoint.json"; then
+            echo "📌 Checkpoint found — triggering next run..."
+            curl -sf -X POST \
+              -H "Authorization: token $DISPATCH_TOKEN" \
+              -H "Accept: application/vnd.github.v3+json" \
+              "https://api.github.com/repos/${{ github.repository }}/dispatches" \
+              -d '{"event_type":"continue_schema_analysis"}'
+            echo "🚀 Next run triggered via $TOKEN_TYPE"
+          else
+            echo "ℹ️  No checkpoint on Drive — nothing to continue"
+          fi
